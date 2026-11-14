@@ -1,16 +1,19 @@
-//! Spotify OAuth, token refresh and the play poller (coming).
-//!
-//! Owned by a later task: only files inside this folder should change.
+//! Spotify OAuth login, token refresh and the background play poller.
+
+mod client;
+mod oauth;
+mod poller;
 
 use axum::Router;
+use axum::routing::get;
 
 use crate::AppState;
 
-/// Routes of this module; empty for now.
+pub use poller::{PollError, poll_all_users, poll_user, spawn_poller};
+
+/// Routes of this module: `/auth/login` and `/auth/callback`.
 pub fn router() -> Router<AppState> {
     Router::new()
+        .route("/auth/login", get(oauth::login))
+        .route("/auth/callback", get(oauth::callback))
 }
-
-/// Start the background poller that records plays for every user.
-/// No-op for now; called once from `main`.
-pub fn spawn_poller(_state: AppState) {}
