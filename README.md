@@ -47,13 +47,59 @@ The database lives in the `spotifast-data` named volume mounted at `/data`.
 
 ## Endpoints
 
-| Method | Path | Auth | Status |
+| Method | Path | Auth | Description |
 | --- | --- | --- | --- |
-| GET | `/health` | none | available, returns `{"status":"ok"}` |
-| GET | `/me` | Bearer | available, returns `id`, `spotify_id`, `display_name` |
-| | Spotify auth (login/callback) | | coming |
-| | Stats endpoints | Bearer | coming |
-| | History import | Bearer | coming |
+| GET | `/health` | none | Returns `{"status":"ok"}` |
+| GET | `/auth/login` | none | Redirects the browser to Spotify's consent page |
+| GET | `/auth/callback` | none | Spotify redirects here; returns `{"token", "user"}` |
+| GET | `/me` | Bearer | Returns `id`, `spotify_id`, `display_name` |
+| GET | `/stats/summary` | Bearer | Plays, listening time, distinct tracks/artists/albums, first and last play |
+| GET | `/stats/top/tracks` | Bearer | Top tracks |
+| GET | `/stats/top/artists` | Bearer | Top artists |
+| GET | `/stats/top/albums` | Bearer | Top albums |
+| GET | `/stats/listening-time` | Bearer | Plays and listening time per `bucket` (`day`, `week`, `month`), UTC |
+| GET | `/history` | Bearer | Plays, newest first |
+| POST | `/import` | Bearer | Imports one Spotify extended streaming history file |
 
 Authenticated routes expect `Authorization: Bearer <token>`. Errors are JSON:
 `{"error": "..."}`.
+
+### Getting a token
+
+Open `http://<host>:8080/auth/login` in a browser and accept on Spotify. The
+callback page shows a JSON document; keep its `token`, it is shown only once
+(log in again to get a new one). Each Spotify account that logs in becomes a
+separate user, and its plays are recorded from then on, every
+`POLL_INTERVAL_SECS`.
+
+### Query parameters
+
+- Period (all `/stats/*` routes): `range` = `4w`, `6m`, `1y` or `lifetime`
+  (default), or `from` / `to` (unix milliseconds or RFC 3339, `to` exclusive).
+  `range` cannot be combined with `from` / `to`.
+- Top routes: `sort` = `plays` (default) or `duration`, `limit` (default 50,
+  max 200), `offset`.
+- `/history`: `limit` and `before` (a `played_at` cursor); the response gives
+  `next_before` for the next page.
+
+```sh
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:8080/stats/top/artists?range=6m&limit=10"
+```
+
+### Importing your history
+
+Request your **Extended streaming history** from Spotify's privacy page, then
+send each `Streaming_History_Audio_*.json` file, one request per file (64 MB
+max):
+
+```sh
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  --data-binary @Streaming_History_Audio_2021-2022_3.json \
+  http://127.0.0.1:8080/import
+```
+
+Entries under 30 seconds, podcasts and local files are skipped, and so are
+listens already recorded by the poller. Importing the same file twice adds
+nothing.
