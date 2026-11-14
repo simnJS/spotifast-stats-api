@@ -166,6 +166,59 @@ async fn dedups_against_polled_play_and_keeps_known_metadata() {
     );
 }
 
+/// Import an entry for track "a" (200 s listened, ending 2021-03-01T10:00:00Z,
+/// so started 09:56:40Z) while the user already has a poll play at
+/// `played_at_ms`. Returns the response body and the resulting play count.
+async fn import_a_with_existing_play(played_at_ms: i64) -> (Value, i64) {
+    let s = state().await;
+    let (user, token) = user_with_token(&s, "u1").await;
+    let tid = db::upsert_track(&s.pool, "a", "Known", "KA", "KB", Some(200_000))
+        .await
+        .unwrap();
+    db::insert_play(
+        &s.pool,
+        user,
+        tid,
+        played_at_ms,
+        200_000,
+        db::PlaySource::Poll,
+    )
+    .await
+    .unwrap();
+    let fixture = json!([track("2021-03-01T10:00:00Z", 200_000, "a")]);
+    let (_, body) = post_import(&s, Some(&token), fixture.to_string()).await;
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM plays")
+        .fetch_one(&s.pool)
+        .await
+        .unwrap();
+    (body, n)
+}
+
+#[tokio::test]
+async fn poll_play_stamped_at_stream_start_is_a_duplicate() {
+    let (body, n) = import_a_with_existing_play(1_614_592_800_000 - 200_000 + 5_000).await;
+    assert_eq!(body["imported"], 0);
+    assert_eq!(body["skipped_duplicate"], 1);
+    assert_eq!(n, 1);
+}
+
+#[tokio::test]
+async fn poll_play_stamped_at_stream_end_is_a_duplicate() {
+    let (body, n) = import_a_with_existing_play(1_614_592_800_000 + 30_000).await;
+    assert_eq!(body["imported"], 0);
+    assert_eq!(body["skipped_duplicate"], 1);
+    assert_eq!(n, 1);
+}
+
+#[tokio::test]
+async fn separate_earlier_listen_outside_window_is_imported() {
+    // 5 minutes before the start of the stream.
+    let (body, n) = import_a_with_existing_play(1_614_592_800_000 - 200_000 - 300_000).await;
+    assert_eq!(body["imported"], 1);
+    assert_eq!(body["skipped_duplicate"], 0);
+    assert_eq!(n, 2);
+}
+
 #[tokio::test]
 async fn null_names_do_not_erase_known_ones() {
     let s = state().await;

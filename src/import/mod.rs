@@ -2,6 +2,23 @@
 //!
 //! `POST /import` takes the raw JSON array of one `Streaming_History_Audio_*.json`
 //! file and stores its plays (source `import`) for the authenticated user.
+//!
+//! # Duplicates
+//!
+//! An entry's `ts` is the END of the stream; it was listened during
+//! `[ts - ms_played, ts]`. Polled plays store Spotify's recently-played
+//! `played_at`, and it is not established whether that marks the start or the
+//! end of the listen. An entry is therefore a duplicate when the user already
+//! has a play of the same track whose `played_at` is within
+//! `[ts - ms_played - DEDUP_WINDOW_MS, ts + DEDUP_WINDOW_MS]`: the whole listen
+//! plus a 60 s tolerance. That covers a poll stamped at the start, at the end,
+//! or anywhere between, and re-imports (existing import rows have
+//! `played_at == ts`). A genuinely separate earlier listen of the same track,
+//! stamped before that interval, is still imported. The cost: an immediate
+//! replay whose earlier poll row sits inside the interval is treated as a
+//! duplicate; this is accepted to avoid double counting.
+//! The comparison is made against plays existing before the import, so close
+//! repeats inside one file are kept (exact repeats are caught by the unique key).
 
 use std::collections::HashMap;
 
@@ -24,12 +41,8 @@ pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// Entries played for less than this are skips, not listens.
 pub const MIN_MS_PLAYED: i64 = 30_000;
 
-/// Duplicate window, in ms: an entry is a duplicate when the user already has a
-/// play of the same track whose `played_at` is within `±DEDUP_WINDOW_MS` of the
-/// entry's `ts`. Both the export's `ts` and Spotify's recently-played
-/// `played_at` mark the END of the stream, so they differ only by clock/rounding
-/// skew (seconds); 60 s absorbs that while staying below the shortest possible
-/// genuine replay gap (a track must play >= 30 s, then play again).
+/// Duplicate tolerance, in ms, added on both sides of the listen (see the
+/// module doc). Absorbs clock/rounding skew between the export and Spotify's API.
 pub const DEDUP_WINDOW_MS: i64 = 60_000;
 
 /// Routes of this module.
@@ -150,7 +163,7 @@ async fn store(
                  WHERE user_id = ?1 AND played_at BETWEEN ?2 AND ?3 AND track_id = ?4)",
             )
             .bind(user_id)
-            .bind(c.played_at_ms - DEDUP_WINDOW_MS)
+            .bind(c.played_at_ms - c.ms_played - DEDUP_WINDOW_MS)
             .bind(c.played_at_ms + DEDUP_WINDOW_MS)
             .bind(track_id)
             .fetch_one(&mut *conn)
