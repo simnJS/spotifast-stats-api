@@ -1,0 +1,105 @@
+//! Parsing of the query parameters shared by the stats endpoints.
+
+use chrono::{DateTime, Months, Utc};
+
+use crate::error::{AppError, AppResult};
+
+/// A half-open period `[from, to)` in unix milliseconds (UTC).
+#[derive(Debug, Clone, Copy)]
+pub struct Period {
+    pub from: i64,
+    pub to: i64,
+}
+
+fn bad(msg: impl Into<String>) -> AppError {
+    AppError::BadRequest(msg.into())
+}
+
+/// Parse a timestamp given as unix milliseconds or as RFC 3339.
+pub fn parse_instant(name: &str, value: &str) -> AppResult<i64> {
+    let v = value.trim();
+    let digits = v.strip_prefix('-').unwrap_or(v);
+    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+        return v
+            .parse::<i64>()
+            .map_err(|_| bad(format!("invalid `{name}`: out of range")));
+    }
+    DateTime::parse_from_rfc3339(v)
+        .map(|d| d.timestamp_millis())
+        .map_err(|_| bad(format!("invalid `{name}`: expected unix ms or RFC 3339")))
+}
+
+impl Period {
+    /// Resolve the period from `range` or `from`/`to`, relative to `now_ms`.
+    pub fn resolve(
+        range: Option<&str>,
+        from: Option<&str>,
+        to: Option<&str>,
+        now_ms: i64,
+    ) -> AppResult<Self> {
+        if range.is_some() && (from.is_some() || to.is_some()) {
+            return Err(bad("`range` cannot be combined with `from`/`to`"));
+        }
+        if from.is_some() || to.is_some() {
+            let from = from.map(|v| parse_instant("from", v)).transpose()?;
+            let to = to.map(|v| parse_instant("to", v)).transpose()?;
+            let period = Self {
+                from: from.unwrap_or(i64::MIN),
+                to: to.unwrap_or(i64::MAX),
+            };
+            if period.from >= period.to {
+                return Err(bad("`from` must be before `to`"));
+            }
+            return Ok(period);
+        }
+        let now = DateTime::<Utc>::from_timestamp_millis(now_ms)
+            .ok_or_else(|| AppError::Internal("clock out of range".into()))?;
+        let start = match range.unwrap_or("lifetime") {
+            "lifetime" => None,
+            "4w" => Some(now - chrono::Duration::weeks(4)),
+            "6m" => now.checked_sub_months(Months::new(6)),
+            "1y" => now.checked_sub_months(Months::new(12)),
+            other => {
+                return Err(bad(format!(
+                    "invalid `range` `{other}`: expected 4w, 6m, 1y or lifetime"
+                )));
+            }
+        };
+        Ok(Self {
+            from: start.map_or(i64::MIN, |d| d.timestamp_millis()),
+            to: i64::MAX,
+        })
+    }
+}
+
+/// Parse the `limit` parameter (default 50, between 1 and 200).
+pub fn parse_limit(value: Option<&str>) -> AppResult<i64> {
+    match value {
+        None => Ok(50),
+        Some(v) => {
+            let n: i64 = v
+                .parse()
+                .map_err(|_| bad("invalid `limit`: expected an integer"))?;
+            if !(1..=200).contains(&n) {
+                return Err(bad("invalid `limit`: must be between 1 and 200"));
+            }
+            Ok(n)
+        }
+    }
+}
+
+/// Parse the `offset` parameter (default 0).
+pub fn parse_offset(value: Option<&str>) -> AppResult<i64> {
+    match value {
+        None => Ok(0),
+        Some(v) => {
+            let n: i64 = v
+                .parse()
+                .map_err(|_| bad("invalid `offset`: expected an integer"))?;
+            if n < 0 {
+                return Err(bad("invalid `offset`: must be >= 0"));
+            }
+            Ok(n)
+        }
+    }
+}
