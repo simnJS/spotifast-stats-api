@@ -1,0 +1,9 @@
+target
+.git
+.github
+.env
+data
+*.db
+*.db-shm
+*.db-wal
+.hangar

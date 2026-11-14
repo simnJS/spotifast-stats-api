@@ -1,0 +1,62 @@
+//! Application error type, rendered as a JSON `{"error": "..."}` body.
+
+use axum::Json;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use serde_json::json;
+
+#[derive(Debug, thiserror::Error)]
+pub enum AppError {
+    #[error("{0}")]
+    BadRequest(String),
+    #[error("{0}")]
+    Unauthorized(String),
+    #[error("{0}")]
+    NotFound(String),
+    /// An upstream service (e.g. Spotify) failed.
+    #[error("{0}")]
+    BadGateway(String),
+    #[error("{0}")]
+    Internal(String),
+}
+
+impl AppError {
+    pub fn status(&self) -> StatusCode {
+        match self {
+            Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            Self::NotFound(_) => StatusCode::NOT_FOUND,
+            Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
+            Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let status = self.status();
+        let message = match &self {
+            // Do not leak internal details to clients.
+            Self::Internal(m) => {
+                tracing::error!(error = %m, "internal error");
+                "internal server error".to_string()
+            }
+            other => other.to_string(),
+        };
+        (status, Json(json!({ "error": message }))).into_response()
+    }
+}
+
+impl From<sqlx::Error> for AppError {
+    fn from(e: sqlx::Error) -> Self {
+        Self::Internal(e.to_string())
+    }
+}
+
+impl From<reqwest::Error> for AppError {
+    fn from(e: reqwest::Error) -> Self {
+        Self::BadGateway(e.to_string())
+    }
+}
+
+pub type AppResult<T> = Result<T, AppError>;
