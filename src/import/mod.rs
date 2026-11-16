@@ -1,7 +1,16 @@
 //! Import of Spotify "Extended streaming history" files.
 //!
 //! `POST /import` takes the raw JSON array of one `Streaming_History_Audio_*.json`
-//! file and stores its plays (source `import`) for the authenticated user.
+//! file (`Content-Type: application/json`) and stores its plays (source
+//! `import`) for the authenticated user.
+//!
+//! With `Content-Type: application/zip` the body is the whole export archive:
+//! every `Streaming_History_Audio_*.json` entry (in any folder) is imported, in
+//! name order, in a single transaction, and the response is a per-file report.
+//! Everything else in the archive is ignored. The archive is read in memory
+//! only (nothing is written to disk), with limits on the number of entries, the
+//! path names and the uncompressed size. Files after the first are deduplicated
+//! against the plays stored by the earlier ones.
 //!
 //! # Duplicates
 //!
@@ -17,15 +26,19 @@
 //! stamped before that interval, is still imported. The cost: an immediate
 //! replay whose earlier poll row sits inside the interval is treated as a
 //! duplicate; this is accepted to avoid double counting.
-//! The comparison is made against plays existing before the import, so close
-//! repeats inside one file are kept (exact repeats are caught by the unique key).
+//! The comparison is made against plays existing before the import of the
+//! file, so close repeats inside one file are kept (exact repeats are caught by
+//! the unique key).
 
 use std::collections::HashMap;
+use std::io::{Cursor, Read};
 
 use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use serde::{Deserialize, Serialize};
 use sqlx::SqliteConnection;
@@ -35,8 +48,21 @@ use crate::auth::AuthUser;
 use crate::db::PlaySource;
 use crate::error::{AppError, AppResult};
 
-/// Maximum accepted body size for this route (files are tens of MB).
+/// Maximum accepted body size for a single JSON file (files are tens of MB).
 pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Maximum accepted body size for a zip archive (the compressed export).
+pub const MAX_ZIP_BODY_BYTES: usize = 200 * 1024 * 1024;
+
+/// Maximum total uncompressed size of the imported files of one archive,
+/// enforced while reading (declared sizes are not trusted).
+pub const MAX_UNCOMPRESSED_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Maximum number of entries (files and folders) in an archive.
+pub const MAX_ZIP_ENTRIES: usize = 10_000;
+
+/// Maximum length, in bytes, of an entry path.
+pub const MAX_ENTRY_PATH_BYTES: usize = 512;
 
 /// Entries played for less than this are skips, not listens.
 pub const MIN_MS_PLAYED: i64 = 30_000;
@@ -47,9 +73,10 @@ pub const DEDUP_WINDOW_MS: i64 = 60_000;
 
 /// Routes of this module.
 pub fn router() -> Router<AppState> {
+    // The route-wide limit fits zips; a single JSON body is capped by hand.
     Router::new().route(
         "/import",
-        post(import_history).layer(DefaultBodyLimit::max(MAX_BODY_BYTES)),
+        post(import_history).layer(DefaultBodyLimit::max(MAX_ZIP_BODY_BYTES)),
     )
 }
 
@@ -74,6 +101,40 @@ pub struct ImportSummary {
     pub skipped_duplicate: usize,
 }
 
+impl ImportSummary {
+    fn add(&mut self, other: &ImportSummary) {
+        self.received += other.received;
+        self.imported += other.imported;
+        self.skipped_short += other.skipped_short;
+        self.skipped_not_track += other.skipped_not_track;
+        self.skipped_duplicate += other.skipped_duplicate;
+    }
+}
+
+/// Report line of one file of an archive.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct FileReport {
+    pub name: String,
+    #[serde(flatten)]
+    pub counts: ImportSummary,
+}
+
+/// Response for a zip archive.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct ArchiveReport {
+    pub files: Vec<FileReport>,
+    pub totals: ImportSummary,
+    pub ignored_files: Vec<String>,
+}
+
+/// Response of `POST /import`: a summary for a JSON body, a report for a zip.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ImportResponse {
+    Single(ImportSummary),
+    Archive(ArchiveReport),
+}
+
 /// An entry that passed the static filters.
 struct Candidate {
     spotify_id: String,
@@ -84,25 +145,26 @@ struct Candidate {
     ms_played: i64,
 }
 
-async fn import_history(
-    State(state): State<AppState>,
-    user: AuthUser,
-    body: Bytes,
-) -> AppResult<Json<ImportSummary>> {
-    let entries: Vec<Entry> = serde_json::from_slice(&body)
-        .map_err(|e| AppError::BadRequest(format!("invalid streaming history JSON: {e}")))?;
+/// A file parsed and validated, not yet stored.
+struct ParsedFile {
+    /// Counters known before touching the database.
+    counts: ImportSummary,
+    candidates: Vec<Candidate>,
+}
 
-    // Validate everything before touching the database.
-    let mut summary = ImportSummary {
+/// Parse and validate the content of one history file.
+fn parse_history(bytes: &[u8]) -> Result<ParsedFile, String> {
+    let entries: Vec<Entry> = serde_json::from_slice(bytes)
+        .map_err(|e| format!("invalid streaming history JSON: {e}"))?;
+
+    let mut counts = ImportSummary {
         received: entries.len(),
         ..Default::default()
     };
     let mut candidates = Vec::new();
     for (i, e) in entries.into_iter().enumerate() {
         let ts = chrono::DateTime::parse_from_rfc3339(&e.ts)
-            .map_err(|err| {
-                AppError::BadRequest(format!("entry {i}: invalid `ts` {:?}: {err}", e.ts))
-            })?
+            .map_err(|err| format!("entry {i}: invalid `ts` {:?}: {err}", e.ts))?
             .timestamp_millis();
         let spotify_id = e
             .spotify_track_uri
@@ -110,11 +172,11 @@ async fn import_history(
             .and_then(|u| u.strip_prefix("spotify:track:"))
             .filter(|id| !id.is_empty());
         let Some(spotify_id) = spotify_id else {
-            summary.skipped_not_track += 1;
+            counts.skipped_not_track += 1;
             continue;
         };
         if e.ms_played < MIN_MS_PLAYED {
-            summary.skipped_short += 1;
+            counts.skipped_short += 1;
             continue;
         }
         candidates.push(Candidate {
@@ -126,13 +188,167 @@ async fn import_history(
             ms_played: e.ms_played,
         });
     }
+    Ok(ParsedFile { counts, candidates })
+}
+
+/// Is the `Content-Type` a zip archive?
+fn is_zip(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            let media = v
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            media == "application/zip" || media == "application/x-zip-compressed"
+        })
+}
+
+/// Reject absolute paths, `..` segments, NULs and over-long names.
+fn check_entry_path(name: &str) -> AppResult<()> {
+    let bad =
+        |why: &str| AppError::BadRequest(format!("unsafe path in zip archive {name:?}: {why}"));
+    if name.len() > MAX_ENTRY_PATH_BYTES {
+        return Err(bad("path too long"));
+    }
+    if name.contains('\0') {
+        return Err(bad("NUL character"));
+    }
+    if name.starts_with('/') || name.starts_with('\\') {
+        return Err(bad("absolute path"));
+    }
+    if name.split(['/', '\\']).any(|seg| seg == "..") {
+        return Err(bad("`..` segment"));
+    }
+    Ok(())
+}
+
+/// Does this archive path name an audio history file (in any folder)?
+fn is_audio_history(name: &str) -> bool {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    base.starts_with("Streaming_History_Audio_") && base.ends_with(".json")
+}
+
+/// The files of an archive, parsed, plus the names of the ignored entries.
+struct ParsedArchive {
+    files: Vec<(String, ParsedFile)>,
+    ignored: Vec<String>,
+}
+
+/// Read the archive in memory and parse every matching file, in name order.
+/// Any problem is a 400 naming it.
+fn parse_archive(body: Bytes) -> AppResult<ParsedArchive> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(body))
+        .map_err(|e| AppError::BadRequest(format!("invalid zip archive: {e}")))?;
+    if archive.len() > MAX_ZIP_ENTRIES {
+        return Err(AppError::BadRequest(format!(
+            "zip archive has too many entries ({}, maximum {MAX_ZIP_ENTRIES})",
+            archive.len()
+        )));
+    }
+
+    let mut matched: Vec<(String, usize)> = Vec::new();
+    let mut ignored: Vec<String> = Vec::new();
+    for i in 0..archive.len() {
+        let file = archive
+            .by_index_raw(i)
+            .map_err(|e| AppError::BadRequest(format!("invalid zip archive: entry {i}: {e}")))?;
+        let name = file.name().to_string();
+        check_entry_path(&name)?;
+        if file.is_dir() {
+            continue;
+        }
+        if is_audio_history(&name) {
+            matched.push((name, i));
+        } else {
+            ignored.push(name);
+        }
+    }
+    if matched.is_empty() {
+        return Err(AppError::BadRequest(
+            "no Streaming_History_Audio_*.json file found in the zip archive".to_string(),
+        ));
+    }
+    matched.sort();
+    ignored.sort();
+
+    let mut total: u64 = 0;
+    let mut files = Vec::with_capacity(matched.len());
+    for (name, index) in matched {
+        let file = archive
+            .by_index(index)
+            .map_err(|e| AppError::BadRequest(format!("invalid zip archive: {name}: {e}")))?;
+        let remaining = MAX_UNCOMPRESSED_BYTES - total;
+        let mut buf = Vec::new();
+        // Declared sizes are not trusted: stop reading once the budget is spent.
+        file.take(remaining + 1)
+            .read_to_end(&mut buf)
+            .map_err(|e| AppError::BadRequest(format!("invalid zip archive: {name}: {e}")))?;
+        if buf.len() as u64 > remaining {
+            return Err(AppError::BadRequest(format!(
+                "zip archive too large once uncompressed (maximum {MAX_UNCOMPRESSED_BYTES} bytes), at {name}"
+            )));
+        }
+        total += buf.len() as u64;
+        let parsed =
+            parse_history(&buf).map_err(|m| AppError::BadRequest(format!("{name}: {m}")))?;
+        files.push((name, parsed));
+    }
+    Ok(ParsedArchive { files, ignored })
+}
+
+async fn import_history(
+    State(state): State<AppState>,
+    user: AuthUser,
+    headers: HeaderMap,
+    body: Bytes,
+) -> AppResult<Response> {
+    if is_zip(&headers) {
+        // Decompression and parsing are CPU work: keep them off the async threads.
+        let parsed = tokio::task::spawn_blocking(move || parse_archive(body))
+            .await
+            .map_err(|e| AppError::Internal(format!("zip task failed: {e}")))??;
+
+        // One transaction for the whole archive: all or nothing. Files are
+        // stored in order, so later files are deduplicated against earlier ones.
+        let mut tx = state.pool.begin().await?;
+        let mut files = Vec::with_capacity(parsed.files.len());
+        let mut totals = ImportSummary::default();
+        for (name, file) in parsed.files {
+            let mut counts = file.counts;
+            let (imported, duplicates) = store(&mut tx, user.user_id, file.candidates).await?;
+            counts.imported = imported;
+            counts.skipped_duplicate = duplicates;
+            totals.add(&counts);
+            files.push(FileReport { name, counts });
+        }
+        tx.commit().await?;
+        return Ok(Json(ImportResponse::Archive(ArchiveReport {
+            files,
+            totals,
+            ignored_files: parsed.ignored,
+        }))
+        .into_response());
+    }
+
+    if body.len() > MAX_BODY_BYTES {
+        return Ok(StatusCode::PAYLOAD_TOO_LARGE.into_response());
+    }
+    // Validate everything before touching the database.
+    let ParsedFile {
+        mut counts,
+        candidates,
+    } = parse_history(&body).map_err(AppError::BadRequest)?;
 
     let mut tx = state.pool.begin().await?;
     let (imported, duplicates) = store(&mut tx, user.user_id, candidates).await?;
     tx.commit().await?;
-    summary.imported = imported;
-    summary.skipped_duplicate = duplicates;
-    Ok(Json(summary))
+    counts.imported = imported;
+    counts.skipped_duplicate = duplicates;
+    Ok(Json(ImportResponse::Single(counts)).into_response())
 }
 
 /// Insert the candidates; returns `(imported, duplicates)`.

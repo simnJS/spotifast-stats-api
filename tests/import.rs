@@ -11,10 +11,48 @@ async fn state() -> AppState {
 }
 
 async fn post_import(state: &AppState, token: Option<&str>, body: String) -> (StatusCode, Value) {
+    post_raw(state, token, "application/json", body.into_bytes()).await
+}
+
+async fn post_zip(state: &AppState, token: Option<&str>, body: Vec<u8>) -> (StatusCode, Value) {
+    post_raw(state, token, "application/zip", body).await
+}
+
+/// Build a zip archive in memory: `(path, content)` pairs, deflated.
+fn make_zip(files: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    use std::io::Write;
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for (name, content) in files {
+        writer.start_file(*name, options).unwrap();
+        writer.write_all(content).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+fn json_bytes(v: &Value) -> Vec<u8> {
+    v.to_string().into_bytes()
+}
+
+async fn count(s: &AppState, table: &str) -> i64 {
+    let (n,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {table}"))
+        .fetch_one(&s.pool)
+        .await
+        .unwrap();
+    n
+}
+
+async fn post_raw(
+    state: &AppState,
+    token: Option<&str>,
+    content_type: &str,
+    body: Vec<u8>,
+) -> (StatusCode, Value) {
     let mut req = Request::builder()
         .method("POST")
         .uri("/import")
-        .header("content-type", "application/json");
+        .header("content-type", content_type);
     if let Some(t) = token {
         req = req.header("authorization", format!("Bearer {t}"));
     }
@@ -316,4 +354,271 @@ async fn large_file_imports_quickly() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["imported"], 15_000);
     assert!(started.elapsed().as_secs() < 30, "{:?}", started.elapsed());
+}
+
+// ---- zip archives -------------------------------------------------------
+
+const DIR: &str = "Spotify Extended Streaming History/";
+
+/// Two audio files in a folder, plus entries that must be ignored.
+fn export_zip() -> Vec<u8> {
+    let part0 = json!([
+        track("2021-03-01T10:00:00Z", 200_000, "a"),
+        track("2021-03-01T10:05:00Z", 180_000, "b"),
+        track("2021-03-01T10:10:00Z", 5_000, "a"), // short
+        {"ts": "2021-03-01T11:00:00Z", "ms_played": 900_000, "spotify_track_uri": null},
+    ]);
+    let part1 = json!([
+        track("2021-03-02T10:00:00Z", 100_000, "c"),
+        track("2021-03-02T10:05:00Z", 100_000, "a"),
+    ]);
+    make_zip(&[
+        (
+            format!("{DIR}Streaming_History_Audio_2021_1.json").as_str(),
+            json_bytes(&part1),
+        ),
+        (
+            format!("{DIR}Streaming_History_Audio_2020-2021_0.json").as_str(),
+            json_bytes(&part0),
+        ),
+        (
+            format!("{DIR}Streaming_History_Video_2021.json").as_str(),
+            b"not even json".to_vec(),
+        ),
+        (
+            format!("{DIR}ReadMeFirst_ExtendedStreamingHistory.pdf").as_str(),
+            b"%PDF-1.4".to_vec(),
+        ),
+        ("Userdata.json", b"[]".to_vec()),
+    ])
+}
+
+#[tokio::test]
+async fn zip_import_reports_per_file_and_ignores_the_rest() {
+    let s = state().await;
+    let (user, token) = user_with_token(&s, "u1").await;
+    let (status, body) = post_zip(&s, Some(&token), export_zip()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        json!({
+            "files": [
+                {"name": format!("{DIR}Streaming_History_Audio_2020-2021_0.json"),
+                 "received": 4, "imported": 2, "skipped_short": 1,
+                 "skipped_not_track": 1, "skipped_duplicate": 0},
+                {"name": format!("{DIR}Streaming_History_Audio_2021_1.json"),
+                 "received": 2, "imported": 2, "skipped_short": 0,
+                 "skipped_not_track": 0, "skipped_duplicate": 0},
+            ],
+            "totals": {"received": 6, "imported": 4, "skipped_short": 1,
+                       "skipped_not_track": 1, "skipped_duplicate": 0},
+            "ignored_files": [
+                format!("{DIR}ReadMeFirst_ExtendedStreamingHistory.pdf"),
+                format!("{DIR}Streaming_History_Video_2021.json"),
+                "Userdata.json",
+            ],
+        })
+    );
+    let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM plays WHERE user_id = ?1")
+        .bind(user)
+        .fetch_one(&s.pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 4);
+}
+
+#[tokio::test]
+async fn zip_import_matches_files_in_any_folder() {
+    let s = state().await;
+    let (_, token) = user_with_token(&s, "u1").await;
+    let zip = make_zip(&[
+        (
+            "Streaming_History_Audio_1.json",
+            json_bytes(&json!([track("2021-03-01T10:00:00Z", 200_000, "a")])),
+        ),
+        (
+            "deep/er/folder/Streaming_History_Audio_2.json",
+            json_bytes(&json!([track("2021-03-01T12:00:00Z", 200_000, "b")])),
+        ),
+    ]);
+    let (status, body) = post_zip(&s, Some(&token), zip).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["totals"]["imported"], 2);
+    assert_eq!(body["files"].as_array().unwrap().len(), 2);
+    assert_eq!(body["ignored_files"], json!([]));
+}
+
+#[tokio::test]
+async fn zip_import_does_not_double_count_across_files() {
+    let s = state().await;
+    let (_, token) = user_with_token(&s, "u1").await;
+    // The same listen appears in both files (the second one 20 s off).
+    let zip = make_zip(&[
+        (
+            "Streaming_History_Audio_1.json",
+            json_bytes(&json!([track("2021-03-01T10:00:00Z", 200_000, "a")])),
+        ),
+        (
+            "Streaming_History_Audio_2.json",
+            json_bytes(&json!([
+                track("2021-03-01T10:00:20Z", 200_000, "a"),
+                track("2021-03-01T12:00:00Z", 200_000, "b"),
+            ])),
+        ),
+    ]);
+    let (status, body) = post_zip(&s, Some(&token), zip).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["files"][0]["imported"], 1);
+    assert_eq!(body["files"][1]["imported"], 1);
+    assert_eq!(body["files"][1]["skipped_duplicate"], 1);
+    assert_eq!(body["totals"]["imported"], 2);
+    assert_eq!(body["totals"]["skipped_duplicate"], 1);
+    assert_eq!(count(&s, "plays").await, 2);
+}
+
+#[tokio::test]
+async fn zip_reimport_is_idempotent() {
+    let s = state().await;
+    let (_, token) = user_with_token(&s, "u1").await;
+    let (_, first) = post_zip(&s, Some(&token), export_zip()).await;
+    assert_eq!(first["totals"]["imported"], 4);
+    let (status, second) = post_zip(&s, Some(&token), export_zip()).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["totals"]["imported"], 0);
+    assert_eq!(second["totals"]["skipped_duplicate"], 4);
+    assert_eq!(count(&s, "plays").await, 4);
+}
+
+#[tokio::test]
+async fn zip_with_invalid_inner_json_is_400_and_writes_nothing() {
+    let s = state().await;
+    let (_, token) = user_with_token(&s, "u1").await;
+    let zip = make_zip(&[
+        (
+            "Streaming_History_Audio_0.json",
+            json_bytes(&json!([track("2021-03-01T10:00:00Z", 200_000, "a")])),
+        ),
+        ("Streaming_History_Audio_1.json", b"{ broken".to_vec()),
+    ]);
+    let (status, body) = post_zip(&s, Some(&token), zip).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let message = body["error"].as_str().unwrap();
+    assert!(
+        message.contains("Streaming_History_Audio_1.json"),
+        "{message}"
+    );
+    assert_eq!(count(&s, "plays").await, 0);
+    assert_eq!(count(&s, "tracks").await, 0);
+}
+
+#[tokio::test]
+async fn zip_with_invalid_entry_is_400_and_writes_nothing() {
+    let s = state().await;
+    let (_, token) = user_with_token(&s, "u1").await;
+    let zip = make_zip(&[
+        (
+            "Streaming_History_Audio_0.json",
+            json_bytes(&json!([track("2021-03-01T10:00:00Z", 200_000, "a")])),
+        ),
+        (
+            "Streaming_History_Audio_1.json",
+            json_bytes(&json!([
+                {"ts": "yesterday", "ms_played": 1, "spotify_track_uri": "spotify:track:b"}
+            ])),
+        ),
+    ]);
+    let (status, body) = post_zip(&s, Some(&token), zip).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let message = body["error"].as_str().unwrap();
+    assert!(
+        message.contains("Streaming_History_Audio_1.json"),
+        "{message}"
+    );
+    assert_eq!(count(&s, "plays").await, 0);
+}
+
+#[tokio::test]
+async fn zip_without_matching_file_is_400() {
+    let s = state().await;
+    let (_, token) = user_with_token(&s, "u1").await;
+    let zip = make_zip(&[
+        ("Streaming_History_Video_2021.json", b"[]".to_vec()),
+        ("Userdata.json", b"[]".to_vec()),
+        ("StreamingHistory0.json", b"[]".to_vec()),
+    ]);
+    let (status, body) = post_zip(&s, Some(&token), zip).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let message = body["error"].as_str().unwrap();
+    assert!(message.contains("Streaming_History_Audio_"), "{message}");
+    assert_eq!(count(&s, "plays").await, 0);
+}
+
+#[tokio::test]
+async fn corrupt_zip_is_400_and_writes_nothing() {
+    let s = state().await;
+    let (_, token) = user_with_token(&s, "u1").await;
+    let (status, body) = post_zip(&s, Some(&token), b"this is not a zip".to_vec()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"].as_str().is_some_and(|m| !m.is_empty()));
+    // A truncated archive (central directory cut off) is corrupt too.
+    let mut zip = export_zip();
+    zip.truncate(zip.len() / 2);
+    let (status, body) = post_zip(&s, Some(&token), zip).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(count(&s, "plays").await, 0);
+}
+
+#[tokio::test]
+async fn zip_with_unsafe_path_is_400() {
+    let s = state().await;
+    let (_, token) = user_with_token(&s, "u1").await;
+    let zip = make_zip(&[(
+        "../Streaming_History_Audio_0.json",
+        json_bytes(&json!([track("2021-03-01T10:00:00Z", 200_000, "a")])),
+    )]);
+    let (status, body) = post_zip(&s, Some(&token), zip).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(count(&s, "plays").await, 0);
+}
+
+#[tokio::test]
+async fn zip_requires_authentication() {
+    let s = state().await;
+    let (status, _) = post_zip(&s, None, export_zip()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = post_zip(&s, Some("nope"), export_zip()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn large_zip_imports_quickly() {
+    let s = state().await;
+    let (_, token) = user_with_token(&s, "u1").await;
+    let names: Vec<String> = (0..10)
+        .map(|f| format!("Streaming_History_Audio_{f:02}.json"))
+        .collect();
+    let files: Vec<(&str, Vec<u8>)> = (0..10i64)
+        .map(|f| {
+            let entries: Vec<Value> = (0..15_000i64)
+                .map(|i| {
+                    let secs = 1_600_000_000 + (f * 15_000 + i) * 300;
+                    let ts = chrono::DateTime::from_timestamp(secs, 0)
+                        .unwrap()
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                    track(&ts, 120_000, &format!("t{}", i % 500))
+                })
+                .collect();
+            (
+                names[f as usize].as_str(),
+                json_bytes(&Value::Array(entries)),
+            )
+        })
+        .collect();
+    let zip = make_zip(&files);
+    let started = std::time::Instant::now();
+    let (status, body) = post_zip(&s, Some(&token), zip).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["totals"]["received"], 150_000);
+    assert_eq!(body["totals"]["imported"], 150_000);
+    assert!(started.elapsed().as_secs() < 60, "{:?}", started.elapsed());
 }
