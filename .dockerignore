@@ -2,8 +2,13 @@ target
 .git
 .github
 .env
+.env.*
+!.env.example
 data
 *.db
 *.db-shm
 *.db-wal
 .hangar
+Dockerfile
+docker-compose.yml
+.dockerignore

@@ -12,7 +12,11 @@ each user's Spotify plays and serves listening stats.
 | `SPOTIFY_CLIENT_ID` | required | Spotify app client id |
 | `SPOTIFY_CLIENT_SECRET` | required | Spotify app client secret |
 | `SPOTIFY_REDIRECT_URI` | required | OAuth redirect URI, must match the Spotify app |
-| `POLL_INTERVAL_SECS` | `120` | Interval between play polls |
+| `POLL_INTERVAL_SECS` | `120` | Minimum (and initial) interval between play polls, per user |
+| `POLL_MAX_INTERVAL_SECS` | `600` | Maximum poll interval for inactive users (must be >= `POLL_INTERVAL_SECS`) |
+| `ALLOWED_SPOTIFY_IDS` | unset | Comma-separated Spotify user ids allowed to log in; unset = anyone Spotify lets through |
+| `TRUST_X_FORWARDED_FOR` | `false` | Take the client IP from `X-Forwarded-For`; set `true` only behind a reverse proxy |
+| `AUTH_RATE_LIMIT_PER_MIN` | `20` | Requests per minute and per IP allowed on `/auth/login` and `/auth/callback` |
 | `SPOTIFY_API_BASE` | `https://api.spotify.com/v1` | Spotify Web API base (override for tests) |
 | `SPOTIFY_ACCOUNTS_BASE` | `https://accounts.spotify.com` | Spotify accounts base (override for tests) |
 | `RUST_LOG` | `info` | Log filter |
@@ -33,16 +37,95 @@ Checks: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo
 
 ```sh
 cp .env.example .env   # then edit the Spotify values
-docker compose up --build
+docker compose up -d
+curl http://127.0.0.1:8080/health
 ```
 
-The database lives in the `spotifast-data` named volume mounted at `/data`.
+`docker-compose.yml` uses the published image
+`ghcr.io/simnjs/spotifast-stats-api:latest` and falls back to building the local
+`Dockerfile` (`docker compose up -d --build`). The container runs as a non-root
+user, the database lives in the `spotifast-data` named volume mounted at
+`/data`, and the port is published on `127.0.0.1:8080` only: put a reverse proxy
+in front of it. The image has a `HEALTHCHECK` on `GET /health`.
+
+## Deploy behind a reverse proxy (HTTPS)
+
+Spotify only accepts an `https` redirect URI, except for `127.0.0.1`. So on a
+server, put a TLS-terminating proxy in front of the container. Minimal
+[Caddy](https://caddyserver.com) example (`Caddyfile`, certificates are obtained
+automatically):
+
+```
+stats.example.com {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+In `.env`:
+
+```sh
+SPOTIFY_REDIRECT_URI=https://stats.example.com/auth/callback
+TRUST_X_FORWARDED_FOR=true   # Caddy sets X-Forwarded-For; needed for per-IP rate limiting
+```
+
+Use the same redirect URI in the Spotify dashboard. Only set
+`TRUST_X_FORWARDED_FOR=true` if the API is reachable exclusively through the
+proxy, otherwise clients can spoof their IP.
+
+### Spotify development mode
+
+A new Spotify app starts in development mode:
+
+- the app owner needs a Spotify Premium account;
+- at most 5 users can use the app;
+- each user must be added by hand (name and Spotify email) in the app's
+  dashboard under **User Management**, otherwise login is refused.
+
+Use `ALLOWED_SPOTIFY_IDS` to restrict logins on your side as well.
+
+### Updating
+
+```sh
+docker compose pull
+docker compose up -d
+```
+
+The volume (and so the database) is kept; migrations run at startup.
+
+### Backing up the database
+
+The image ships `sqlite3`. `.backup` gives a consistent copy even while the API
+is running:
+
+```sh
+docker compose exec api sqlite3 /data/spotifast.db ".backup '/data/backup.db'"
+docker compose cp api:/data/backup.db ./spotifast-$(date +%F).db
+docker compose exec api rm /data/backup.db
+```
+
+To restore, stop the stack and copy the file back into the volume, for example
+with a one-off container (adjust the volume name, see `docker volume ls`):
+
+```sh
+docker compose down
+docker run --rm -v spotifast-stats-api_spotifast-data:/data -v "$PWD":/b \
+  debian:bookworm-slim sh -c 'cp /b/spotifast.db /data/spotifast.db && chown 10001:10001 /data/spotifast.db'
+docker compose up -d
+```
+
+## Publishing the image
+
+`.github/workflows/docker.yml` runs fmt, clippy and tests, then builds the image.
+Pull requests only build it (no push). Pushes to `main` publish
+`ghcr.io/<owner>/spotifast-stats-api` tagged `latest` and with the commit sha;
+`v*` tags also publish the version (e.g. `v1.2.3` gives `1.2.3`).
 
 ## Create the Spotify developer app
 
 1. Go to <https://developer.spotify.com/dashboard> and click **Create app**.
 2. Set the **Redirect URI** to the value of `SPOTIFY_REDIRECT_URI`
-   (for example `http://127.0.0.1:8080/auth/callback`). It must match exactly.
+   (for example `http://127.0.0.1:8080/auth/callback`, or an `https` URL in
+   production). It must match exactly.
 3. Copy the **Client ID** and **Client secret** into `.env`.
 
 ## Endpoints

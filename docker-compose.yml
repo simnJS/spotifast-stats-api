@@ -1,14 +1,24 @@
 services:
   api:
+    image: ghcr.io/simnjs/spotifast-stats-api:latest
     build: .
     env_file: .env
     environment:
+      # Override whatever .env says: inside the container the database lives in
+      # the /data volume and the server must listen on all interfaces.
       DATABASE_URL: sqlite:///data/spotifast.db
       BIND_ADDR: 0.0.0.0:8080
     ports:
-      - "8080:8080"
+      # Loopback only: put a reverse proxy (see README) in front of it.
+      - "127.0.0.1:8080:8080"
     volumes:
       - spotifast-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
     restart: unless-stopped
 
 volumes:
