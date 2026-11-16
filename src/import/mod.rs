@@ -256,7 +256,10 @@ fn parse_archive(body: Bytes) -> AppResult<ParsedArchive> {
         let file = archive
             .by_index_raw(i)
             .map_err(|e| AppError::BadRequest(format!("invalid zip archive: entry {i}: {e}")))?;
-        let name = file.name().to_string();
+        let name = file
+            .name()
+            .map_err(|e| AppError::BadRequest(format!("invalid zip archive: entry {i}: {e}")))?
+            .into_owned();
         check_entry_path(&name)?;
         if file.is_dir() {
             continue;
