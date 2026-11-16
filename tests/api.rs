@@ -86,3 +86,12 @@ async fn upsert_track_and_insert_play_helpers() {
     assert!(first);
     assert!(!again);
 }
+
+#[tokio::test]
+async fn health_is_503_without_detail_when_db_is_down() {
+    let s = state().await;
+    s.pool.close().await;
+    let (status, body) = get(&s, "/health", None).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body, serde_json::json!({ "status": "error" }));
+}
