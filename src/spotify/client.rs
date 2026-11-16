@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use crate::AppState;
 
-pub const SCOPES: &str = "user-read-recently-played user-read-private";
+pub const SCOPES: &str = "user-read-recently-played user-read-private user-read-currently-playing";
 
 /// Page size asked from `recently-played`, Spotify's maximum.
 ///
@@ -154,6 +154,17 @@ pub struct ArtistObject {
 #[derive(Debug, Deserialize)]
 pub struct AlbumObject {
     pub name: String,
+}
+
+/// Body of `GET /me/player/currently-playing` (only what is used).
+#[derive(Debug, Deserialize)]
+pub struct CurrentlyPlaying {
+    pub is_playing: bool,
+    pub progress_ms: Option<i64>,
+    /// `track`, `episode`, `ad` or `unknown`.
+    pub currently_playing_type: Option<String>,
+    /// `null` when Spotify cannot say (e.g. a private session).
+    pub item: Option<TrackObject>,
 }
 
 /// Which Spotify service answered: a 400 or a 401 means something different
@@ -386,6 +397,28 @@ pub async fn get_recently_played(
         req = req.query(&[("after", after.to_string())]);
     }
     parse(send(req, what).await?, Service::WebApi, what).await
+}
+
+/// What the user is playing right now: one call, `None` on HTTP 204 (nothing
+/// is playing). A 403 comes back as [`ClientError::Status`] (token without the
+/// `user-read-currently-playing` scope).
+pub async fn get_currently_playing(
+    state: &AppState,
+    access_token: &str,
+) -> Result<Option<CurrentlyPlaying>, ClientError> {
+    let what = "currently-playing";
+    let req = state
+        .http
+        .get(format!(
+            "{}/me/player/currently-playing",
+            state.config.spotify_api_base
+        ))
+        .bearer_auth(access_token);
+    let resp = send(req, what).await?;
+    if resp.status() == StatusCode::NO_CONTENT {
+        return Ok(None);
+    }
+    parse(resp, Service::WebApi, what).await.map(Some)
 }
 
 #[cfg(test)]
