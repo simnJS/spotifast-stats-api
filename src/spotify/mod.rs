@@ -1,6 +1,7 @@
 //! Spotify OAuth login, token refresh and the background play poller.
 
 mod client;
+mod now_playing;
 mod oauth;
 mod poller;
 
@@ -16,4 +17,5 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/auth/login", get(oauth::login))
         .route("/auth/callback", get(oauth::callback))
+        .route("/now-playing", get(now_playing::handler))
 }

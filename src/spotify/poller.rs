@@ -118,16 +118,29 @@ impl From<sqlx::Error> for PollError {
 
 /// The user row as the poller needs it.
 #[derive(sqlx::FromRow)]
-struct UserState {
-    access_token: String,
+pub(super) struct UserState {
+    pub(super) access_token: String,
     refresh_token: String,
     /// Unix seconds.
     token_expires_at: i64,
     /// Cursor: newest `played_at` seen.
     last_polled_at_ms: Option<i64>,
     poll_interval_secs: Option<i64>,
-    rate_limited_until_ms: Option<i64>,
+    pub(super) rate_limited_until_ms: Option<i64>,
     last_error_at_ms: Option<i64>,
+}
+
+impl UserState {
+    pub(super) async fn load(state: &AppState, user_id: i64) -> Result<Self, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT access_token, refresh_token, token_expires_at, last_polled_at_ms,
+                    poll_interval_secs, rate_limited_until_ms, last_error_at_ms
+             FROM users WHERE id = ?1",
+        )
+        .bind(user_id)
+        .fetch_one(&state.pool)
+        .await
+    }
 }
 
 /// What a successful `recently-played` call brought.
@@ -157,14 +170,7 @@ struct Schedule {
 /// the user is rate limited.
 pub async fn poll_user(state: &AppState, user_id: i64, now_ms: i64) -> Result<usize, PollError> {
     let started = Instant::now();
-    let user: UserState = sqlx::query_as(
-        "SELECT access_token, refresh_token, token_expires_at, last_polled_at_ms,
-                poll_interval_secs, rate_limited_until_ms, last_error_at_ms
-         FROM users WHERE id = ?1",
-    )
-    .bind(user_id)
-    .fetch_one(&state.pool)
-    .await?;
+    let user = UserState::load(state, user_id).await?;
     if let Some(until_ms) = user.rate_limited_until_ms
         && until_ms > now_ms
     {
@@ -236,12 +242,7 @@ async fn fetch(
     user: &UserState,
     now_ms: i64,
 ) -> Result<Fetched, PollError> {
-    let now_secs = now_ms.div_euclid(1000);
-    let access = if user.token_expires_at <= now_secs + REFRESH_MARGIN_SECS {
-        refresh_access_token(state, user_id, &user.refresh_token, now_secs).await?
-    } else {
-        user.access_token.clone()
-    };
+    let access = valid_access_token(state, user_id, user, now_ms).await?;
 
     // `after` is exclusive and Spotify only exposes the last 50 plays, so one
     // page holds every readable play after the cursor: taking the newest
@@ -296,6 +297,22 @@ async fn fetch(
         full_page,
         newest,
     })
+}
+
+/// The user's access token, refreshed and stored first only when it expires
+/// within [`REFRESH_MARGIN_SECS`]. Shared with the now-playing endpoint.
+pub(super) async fn valid_access_token(
+    state: &AppState,
+    user_id: i64,
+    user: &UserState,
+    now_ms: i64,
+) -> Result<String, PollError> {
+    let now_secs = now_ms.div_euclid(1000);
+    if user.token_expires_at <= now_secs + REFRESH_MARGIN_SECS {
+        refresh_access_token(state, user_id, &user.refresh_token, now_secs).await
+    } else {
+        Ok(user.access_token.clone())
+    }
 }
 
 /// Refresh and store the access token; returns the new one.
@@ -360,7 +377,7 @@ async fn record_success(
 /// - refresh token refused: [`RELOGIN_ERROR`], next poll in 6 h;
 /// - 401: the access token is marked expired, so the next poll refreshes it;
 /// - anything else: the interval doubles, as when idle.
-async fn record_failure(
+pub(super) async fn record_failure(
     state: &AppState,
     user_id: i64,
     user: &UserState,
