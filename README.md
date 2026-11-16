@@ -156,57 +156,105 @@ how the Dockerfile is tested. Pushes to `main` publish
 
 | Method | Path | Auth | Description |
 | --- | --- | --- | --- |
-| GET | `/health` | none | Returns `{"status":"ok"}` |
-| GET | `/auth/login` | none | Redirects the browser to Spotify's consent page |
-| GET | `/auth/callback` | none | Spotify redirects here; returns `{"token", "user"}` |
-| GET | `/me` | Bearer | Returns `id`, `spotify_id`, `display_name` |
+| GET | `/health` | none | `{"status":"ok"}` when the database answers, 503 otherwise |
+| GET | `/auth/login` | none | Redirects the browser to Spotify's consent page (rate limited per IP) |
+| GET | `/auth/callback` | none | Spotify redirects here; HTML page with the token in a browser, `{"token", "user"}` JSON otherwise |
+| GET | `/me` | Bearer | `id`, `spotify_id`, `display_name` |
+| GET | `/me/status` | Bearer | Poller state: last successful poll, next poll, current interval, rate limit, last error, play count |
+| DELETE | `/me` | Bearer | Deletes the account, its plays and its tokens |
+| GET | `/auth/tokens` | Bearer | Lists your API tokens (`id`, `created_at`, `last_used_at`, `current`) |
+| POST | `/auth/token` | Bearer | Creates a new API token, returned once |
+| DELETE | `/auth/token/{id}` | Bearer | Revokes one of your tokens (the current one included) |
 | GET | `/stats/summary` | Bearer | Plays, listening time, distinct tracks/artists/albums, first and last play |
 | GET | `/stats/top/tracks` | Bearer | Top tracks |
 | GET | `/stats/top/artists` | Bearer | Top artists |
 | GET | `/stats/top/albums` | Bearer | Top albums |
 | GET | `/stats/listening-time` | Bearer | Plays and listening time per `bucket` (`day`, `week`, `month`), UTC |
+| GET | `/stats/hours` | Bearer | Plays per hour of day (24) and per weekday (7), in time zone `tz` |
+| GET | `/stats/streaks` | Bearer | Current and longest run of consecutive listening days, in time zone `tz` |
+| GET | `/stats/compare?with=<user_id>` | Bearer | Artists and tracks in common with another user of the instance, and a similarity score |
 | GET | `/history` | Bearer | Plays, newest first |
-| POST | `/import` | Bearer | Imports one Spotify extended streaming history file |
+| GET | `/now-playing` | Bearer | What you are listening to right now (cached 30 s); 204 when nothing plays |
+| POST | `/import` | Bearer | Imports a Spotify extended streaming history file, or the whole export zip |
 
 Authenticated routes expect `Authorization: Bearer <token>`. Errors are JSON:
 `{"error": "..."}`.
 
 ### Getting a token
 
-Open `http://<host>:8080/auth/login` in a browser and accept on Spotify. The
-callback page shows a JSON document; keep its `token`, it is shown only once
-(log in again to get a new one). Each Spotify account that logs in becomes a
-separate user, and its plays are recorded from then on, every
-`POLL_INTERVAL_SECS`.
+Open `https://<your domain>/auth/login` in a browser and accept on Spotify. The
+callback page shows your API token: copy it, it is shown only once. You can
+create more tokens with `POST /auth/token`, list them with `GET /auth/tokens`
+and revoke them with `DELETE /auth/token/{id}`. Each Spotify account that logs
+in becomes a separate user (restrict who may log in with
+`ALLOWED_SPOTIFY_IDS`), and its plays are recorded from then on.
+
+Users who logged in before `/now-playing` existed must log in again once to
+use it (it needs the `user-read-currently-playing` scope); play tracking keeps
+working without that.
+
+### How plays are recorded
+
+Spotify only returns the 50 most recent plays and the app's quota is shared
+by every user, so the poller is frugal:
+
+- one `recently-played` call per user and per poll, only for plays newer than
+  the last one recorded;
+- the interval adapts per user between `POLL_INTERVAL_SECS` (default 2 min,
+  used while you listen) and `POLL_MAX_INTERVAL_SECS` (default 10 min, when
+  idle), with a little jitter;
+- when Spotify answers 429, that user is not called again before the
+  `Retry-After` delay, even across restarts (it is stored in the database);
+- the access token is refreshed only when it expires; if Spotify revokes it,
+  the user must log in again (`/me/status` says so in `last_error`).
+
+`GET /me/status` shows where your account stands.
 
 ### Query parameters
 
-- Period (all `/stats/*` routes): `range` = `4w`, `6m`, `1y` or `lifetime`
-  (default), or `from` / `to` (unix milliseconds or RFC 3339, `to` exclusive).
-  `range` cannot be combined with `from` / `to`.
+- Period (all `/stats/*` routes except `/stats/streaks`): `range` = `4w`, `6m`,
+  `1y` or `lifetime` (default), or `from` / `to` (unix milliseconds or RFC
+  3339, `to` exclusive). `range` cannot be combined with `from` / `to`.
+- Time zone (`/stats/hours`, `/stats/streaks`): `tz`, an IANA name such as
+  `Europe/Paris` (default `UTC`).
 - Top routes: `sort` = `plays` (default) or `duration`, `limit` (default 50,
   max 200), `offset`.
+- `/stats/compare`: `with` (the other user's id), `limit` (default 20, max
+  100). `similarity` is the weighted Jaccard index of the two users' play
+  counts per artist, between 0 and 1.
 - `/history`: `limit` and `before` (a `played_at` cursor); the response gives
   `next_before` for the next page.
 
 ```sh
 curl -H "Authorization: Bearer $TOKEN" \
-  "http://127.0.0.1:8080/stats/top/artists?range=6m&limit=10"
+  "https://<your domain>/stats/hours?range=6m&tz=Europe/Paris"
 ```
 
 ### Importing your history
 
-Request your **Extended streaming history** from Spotify's privacy page, then
-send each `Streaming_History_Audio_*.json` file, one request per file (64 MB
-max):
+Request your **Extended streaming history** from Spotify's privacy page. Send
+the zip Spotify gives you as it is (200 MB max, 1 GB once uncompressed):
+
+```sh
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/zip" \
+  --data-binary @my_spotify_data.zip \
+  https://<your domain>/import
+```
+
+Every `Streaming_History_Audio_*.json` file in the archive is imported; other
+files (video history, PDF…) are listed in `ignored_files`. The answer gives a
+report per file and `totals`. If one file is invalid, nothing is imported.
+
+A single file can also be sent on its own (64 MB max):
 
 ```sh
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   --data-binary @Streaming_History_Audio_2021-2022_3.json \
-  http://127.0.0.1:8080/import
+  https://<your domain>/import
 ```
 
 Entries under 30 seconds, podcasts and local files are skipped, and so are
-listens already recorded by the poller. Importing the same file twice adds
+listens already recorded by the poller. Importing the same data twice adds
 nothing.
