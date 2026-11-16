@@ -1,13 +1,27 @@
 //! Spotify poller tests, against a wiremock server and an in-memory DB.
+//! Time is injected (`NOW`), so deadlines and schedules are deterministic up to
+//! the real duration of a poll (`SLACK_MS`) and the ±10 % jitter.
 
-use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 use spotifast_stats_api::config::Config;
-use spotifast_stats_api::spotify::{PollError, poll_all_users, poll_user};
+use spotifast_stats_api::spotify::{poll_all_users, poll_user};
 use spotifast_stats_api::{AppState, db};
 use wiremock::matchers::{body_string_contains, header, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+/// Injected "now": 2027-01-15T08:00:00Z, in unix ms.
+const NOW: i64 = 1_800_000_000_000;
+/// Some cursor before `NOW` (newest `played_at` seen), in unix ms.
+const CURSOR: i64 = 1_799_990_000_123;
+/// Outcome times include the real duration of the poll (milliseconds against
+/// wiremock): allow this much.
+const SLACK_MS: i64 = 5_000;
+/// `Config::for_tests()`: POLL_INTERVAL_SECS and POLL_MAX_INTERVAL_SECS.
+const MIN_INTERVAL_S: i64 = 120;
+const MAX_INTERVAL_S: i64 = 600;
+const RECENT: &str = "/v1/me/player/recently-played";
 
 async fn setup() -> (AppState, MockServer) {
     let server = MockServer::start().await;
@@ -16,6 +30,12 @@ async fn setup() -> (AppState, MockServer) {
     config.spotify_accounts_base = server.uri();
     let state = AppState::new(db::test_pool().await, config);
     (state, server)
+}
+
+fn iso(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .unwrap()
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 fn item(track_id: &str, played_at: &str, artists: &[&str]) -> Value {
@@ -29,12 +49,12 @@ fn item(track_id: &str, played_at: &str, artists: &[&str]) -> Value {
     })
 }
 
-/// A user whose access token is valid for a long time.
+/// A user whose access token is valid for a day after `NOW`.
 async fn fresh_user(state: &AppState, spotify_id: &str, access: &str) -> i64 {
     let id = db::insert_test_user(&state.pool, spotify_id).await.unwrap();
     sqlx::query("UPDATE users SET access_token = ?1, token_expires_at = ?2 WHERE id = ?3")
         .bind(access)
-        .bind(chrono::Utc::now().timestamp() + 3600)
+        .bind(NOW / 1000 + 86_400)
         .bind(id)
         .execute(&state.pool)
         .await
@@ -42,11 +62,33 @@ async fn fresh_user(state: &AppState, spotify_id: &str, access: &str) -> i64 {
     id
 }
 
+/// Set one integer column of a user row.
+async fn set(state: &AppState, user_id: i64, column: &str, value: Option<i64>) {
+    sqlx::query(&format!("UPDATE users SET {column} = ?1 WHERE id = ?2"))
+        .bind(value)
+        .bind(user_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+}
+
 async fn mock_recent(server: &MockServer, bearer: &str, items: Vec<Value>) {
     Mock::given(method("GET"))
-        .and(path("/v1/me/player/recently-played"))
+        .and(path(RECENT))
         .and(header("authorization", format!("Bearer {bearer}").as_str()))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "items": items })))
+        .mount(server)
+        .await;
+}
+
+async fn mock_token(server: &MockServer, access: &str, times: u64) {
+    Mock::given(method("POST"))
+        .and(path("/api/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": access, "token_type": "Bearer", "expires_in": 3600,
+        })))
+        .expect(times)
         .mount(server)
         .await;
 }
@@ -60,8 +102,102 @@ async fn play_count(state: &AppState, user_id: i64) -> i64 {
     n
 }
 
+/// The poller columns of a user row.
+#[derive(Debug, sqlx::FromRow)]
+struct PollState {
+    last_polled_at_ms: Option<i64>,
+    next_poll_at_ms: Option<i64>,
+    poll_interval_secs: Option<i64>,
+    rate_limited_until_ms: Option<i64>,
+    last_poll_ok_at_ms: Option<i64>,
+    last_error: Option<String>,
+    last_error_at_ms: Option<i64>,
+    token_expires_at: i64,
+}
+
+async fn poll_state(state: &AppState, user_id: i64) -> PollState {
+    sqlx::query_as(
+        "SELECT last_polled_at_ms, next_poll_at_ms, poll_interval_secs, rate_limited_until_ms,
+                last_poll_ok_at_ms, last_error, last_error_at_ms, token_expires_at
+         FROM users WHERE id = ?1",
+    )
+    .bind(user_id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap()
+}
+
+/// The interval is `interval_s` and the next poll `interval_s` after `from_ms`,
+/// ±10 % jitter.
+fn assert_scheduled(st: &PollState, from_ms: i64, interval_s: i64) {
+    assert_eq!(st.poll_interval_secs, Some(interval_s), "{st:?}");
+    let next = st.next_poll_at_ms.expect("next poll scheduled");
+    let (lo, hi) = (
+        from_ms + interval_s * 900,
+        from_ms + interval_s * 1100 + SLACK_MS,
+    );
+    assert!(
+        (lo..=hi).contains(&next),
+        "next poll {next} not in [{lo}, {hi}]"
+    );
+}
+
+/// (path, authorization header) of every request the server received so far.
+async fn calls(server: &MockServer) -> Vec<(String, String)> {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| {
+            let auth = r
+                .headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            (r.url.path().to_string(), auth.to_string())
+        })
+        .collect()
+}
+
+/// Spotify's recently-played as documented: only the last 50 plays can be read,
+/// `after` keeps those strictly after the cursor, newest first.
+#[derive(Clone, Default)]
+struct History(Arc<Mutex<Vec<i64>>>);
+
+impl History {
+    fn play(&self, played_at_ms: i64) {
+        self.0.lock().unwrap().push(played_at_ms);
+    }
+}
+
+impl Respond for History {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let param = |name: &str| {
+            request
+                .url
+                .query_pairs()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.parse::<i64>().unwrap())
+        };
+        let after = param("after");
+        let limit = param("limit").unwrap_or(20) as usize;
+        let mut plays = self.0.lock().unwrap().clone();
+        plays.sort_unstable();
+        plays.reverse();
+        plays.truncate(50);
+        let items: Vec<Value> = plays
+            .into_iter()
+            .filter(|&p| after.is_none_or(|a| p > a))
+            .take(limit)
+            .map(|p| item(&format!("t{p}"), &iso(p), &["A"]))
+            .collect();
+        ResponseTemplate::new(200).set_body_json(json!({ "items": items }))
+    }
+}
+
 #[tokio::test]
-async fn spotify_poll_inserts_plays_and_is_idempotent() {
+async fn poll_inserts_plays_and_is_idempotent() {
     let (state, server) = setup().await;
     let user = fresh_user(&state, "u1", "tok").await;
     mock_recent(
@@ -74,9 +210,9 @@ async fn spotify_poll_inserts_plays_and_is_idempotent() {
     )
     .await;
 
-    assert_eq!(poll_user(&state, user).await.unwrap(), 2);
+    assert_eq!(poll_user(&state, user, NOW).await.unwrap(), 2);
     // Same data again: nothing new.
-    assert_eq!(poll_user(&state, user).await.unwrap(), 0);
+    assert_eq!(poll_user(&state, user, NOW + 1_000).await.unwrap(), 0);
     assert_eq!(play_count(&state, user).await, 2);
 
     let row: (String, String, i64, i64, String) = sqlx::query_as(
@@ -92,14 +228,14 @@ async fn spotify_poll_inserts_plays_and_is_idempotent() {
     assert_eq!(row.3, 200_000);
     assert_eq!(row.4, "poll");
 
-    let (cursor,): (Option<i64>,) = sqlx::query_as("SELECT last_polled_at_ms FROM users")
-        .fetch_one(&state.pool)
-        .await
-        .unwrap();
-    assert_eq!(cursor, Some(1_704_103_500_500));
+    let st = poll_state(&state, user).await;
+    assert_eq!(st.last_polled_at_ms, Some(1_704_103_500_500));
+    assert!(st.last_poll_ok_at_ms.unwrap() >= NOW + 1_000);
+    assert_eq!(st.last_error, None);
 
     // The second request carried the cursor as `after`.
     let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
     assert!(requests[0].url.query().unwrap().contains("limit=50"));
     assert!(!requests[0].url.query().unwrap().contains("after"));
     assert!(
@@ -111,10 +247,36 @@ async fn spotify_poll_inserts_plays_and_is_idempotent() {
 }
 
 #[tokio::test]
-async fn spotify_expired_token_is_refreshed_before_polling() {
+async fn after_parameter_is_the_stored_cursor() {
     let (state, server) = setup().await;
-    // token_expires_at = 0: expired.
+    let user = fresh_user(&state, "u1", "tok").await;
+    set(&state, user, "last_polled_at_ms", Some(CURSOR)).await;
+    mock_recent(&server, "tok", vec![]).await;
+
+    assert_eq!(poll_user(&state, user, NOW).await.unwrap(), 0);
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let query: Vec<(String, String)> = requests[0]
+        .url
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    assert!(query.contains(&("after".to_string(), CURSOR.to_string())));
+    assert!(query.contains(&("limit".to_string(), "50".to_string())));
+    // Nothing new: the cursor stays where it was.
+    assert_eq!(
+        poll_state(&state, user).await.last_polled_at_ms,
+        Some(CURSOR)
+    );
+}
+
+#[tokio::test]
+async fn token_about_to_expire_is_refreshed_once_then_reused() {
+    let (state, server) = setup().await;
     let user = db::insert_test_user(&state.pool, "u1").await.unwrap();
+    // Expires in 30 s: within the 60 s margin.
+    set(&state, user, "token_expires_at", Some(NOW / 1000 + 30)).await;
     Mock::given(method("POST"))
         .and(path("/api/token"))
         .and(body_string_contains("grant_type=refresh_token"))
@@ -132,7 +294,7 @@ async fn spotify_expired_token_is_refreshed_before_polling() {
     )
     .await;
 
-    assert_eq!(poll_user(&state, user).await.unwrap(), 1);
+    assert_eq!(poll_user(&state, user, NOW).await.unwrap(), 1);
 
     let (access, refresh, exp): (String, String, i64) =
         sqlx::query_as("SELECT access_token, refresh_token, token_expires_at FROM users")
@@ -141,14 +303,42 @@ async fn spotify_expired_token_is_refreshed_before_polling() {
             .unwrap();
     assert_eq!(access, "new-access");
     assert_eq!(refresh, "refresh", "old refresh token is kept when omitted");
-    assert!(exp > chrono::Utc::now().timestamp() + 3000);
+    assert_eq!(exp, NOW / 1000 + 3600);
 
-    // Now valid: a second poll must not refresh again (expect(1) verified on drop).
-    poll_user(&state, user).await.unwrap();
+    // Now valid: the next poll does not refresh again (expect(1) verified on drop).
+    poll_user(&state, user, NOW + 600_000).await.unwrap();
 }
 
 #[tokio::test]
-async fn spotify_two_users_keep_separate_plays() {
+async fn one_recently_played_call_per_due_user_and_no_refresh_while_token_is_valid() {
+    let (state, server) = setup().await;
+    mock_token(&server, "unexpected", 0).await;
+    let mut users = Vec::new();
+    for name in ["a", "b", "c"] {
+        let id = fresh_user(&state, name, &format!("tok-{name}")).await;
+        Mock::given(method("GET"))
+            .and(path(RECENT))
+            .and(header(
+                "authorization",
+                format!("Bearer tok-{name}").as_str(),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "items": [] })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        users.push(id);
+    }
+    // Valid for 90 more seconds: beyond the 60 s margin, so not refreshed either.
+    set(&state, users[2], "token_expires_at", Some(NOW / 1000 + 90)).await;
+
+    assert_eq!(poll_all_users(&state, NOW).await, users);
+    // Nobody is due again a minute later (minimum interval: 2 min ± 10 %).
+    assert!(poll_all_users(&state, NOW + 60_000).await.is_empty());
+    // expect(1) per user and expect(0) on /api/token are verified on drop.
+}
+
+#[tokio::test]
+async fn two_users_keep_separate_plays() {
     let (state, server) = setup().await;
     let a = fresh_user(&state, "ua", "tok-a").await;
     let b = fresh_user(&state, "ub", "tok-b").await;
@@ -168,8 +358,7 @@ async fn spotify_two_users_keep_separate_plays() {
     )
     .await;
 
-    let mut blocked = HashMap::new();
-    poll_all_users(&state, &mut blocked).await;
+    assert_eq!(poll_all_users(&state, NOW).await, [a, b]);
 
     assert_eq!(play_count(&state, a).await, 1);
     assert_eq!(play_count(&state, b).await, 2);
@@ -181,14 +370,15 @@ async fn spotify_two_users_keep_separate_plays() {
 }
 
 #[tokio::test]
-async fn spotify_one_users_failure_does_not_stop_others_and_429_is_honoured() {
+async fn rate_limit_is_per_user_persisted_and_strictly_respected() {
     let (state, server) = setup().await;
     let bad = fresh_user(&state, "bad", "tok-bad").await;
     let good = fresh_user(&state, "good", "tok-good").await;
     Mock::given(method("GET"))
-        .and(path("/v1/me/player/recently-played"))
+        .and(path(RECENT))
         .and(header("authorization", "Bearer tok-bad"))
-        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "7"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "27000"))
+        .expect(1)
         .mount(&server)
         .await;
     mock_recent(
@@ -198,35 +388,218 @@ async fn spotify_one_users_failure_does_not_stop_others_and_429_is_honoured() {
     )
     .await;
 
-    match poll_user(&state, bad).await {
-        Err(PollError::RateLimited(d)) => assert_eq!(d.as_secs(), 7),
-        other => panic!("expected RateLimited, got {other:?}"),
+    assert_eq!(poll_all_users(&state, NOW).await, [bad, good]);
+    assert_eq!(play_count(&state, good).await, 1);
+
+    let st = poll_state(&state, bad).await;
+    let until = st.rate_limited_until_ms.expect("deadline stored");
+    let error_at = st.last_error_at_ms.expect("error time stored");
+    assert_eq!(until - error_at, 27_000 * 1000, "now + Retry-After");
+    assert!((NOW..NOW + SLACK_MS).contains(&error_at));
+    assert!(st.last_error.unwrap().contains("429"));
+    assert_eq!(st.last_polled_at_ms, None, "a failed poll keeps the cursor");
+    assert_eq!(st.last_poll_ok_at_ms, None);
+    assert_eq!(play_count(&state, bad).await, 0);
+    assert_eq!(
+        poll_state(&state, good).await.rate_limited_until_ms,
+        None,
+        "only that user is rate limited"
+    );
+
+    // Meanwhile the access token of `bad` expires: still no refresh before the deadline.
+    set(&state, bad, "token_expires_at", Some(0)).await;
+    // Restart: a new AppState on the same database only knows what the DB says.
+    let state = AppState::new(state.pool.clone(), (*state.config).clone());
+    let before = calls(&server).await.len();
+    // `good` keeps being polled while `bad` waits.
+    assert_eq!(poll_all_users(&state, NOW + 600_000).await, [good]);
+    assert_eq!(poll_all_users(&state, until - 1).await, [good]);
+    let err = poll_user(&state, bad, until - 1).await.unwrap_err();
+    assert_eq!(err.kind(), "still_rate_limited");
+    let seen = calls(&server).await;
+    assert_eq!(seen.len(), before + 2, "only `good` was called");
+    assert!(
+        seen[before..]
+            .iter()
+            .all(|(p, auth)| p != "/api/token" && auth != "Bearer tok-bad")
+    );
+
+    // From the deadline on, `bad` is polled again: token refresh, then recently-played.
+    mock_token(&server, "tok-bad-2", 1).await;
+    mock_recent(
+        &server,
+        "tok-bad-2",
+        vec![item("t2", "2024-01-01T11:00:00Z", &["B"])],
+    )
+    .await;
+    assert!(poll_all_users(&state, until).await.contains(&bad));
+    assert_eq!(play_count(&state, bad).await, 1);
+    let st = poll_state(&state, bad).await;
+    assert_eq!(st.rate_limited_until_ms, None);
+    assert_eq!(st.last_error, None);
+    assert_eq!(st.last_error_at_ms, None);
+    assert!(st.last_poll_ok_at_ms.unwrap() >= until);
+}
+
+#[tokio::test]
+async fn rate_limit_without_retry_after_backs_off_exponentially() {
+    let (state, server) = setup().await;
+    let user = fresh_user(&state, "u1", "tok").await;
+    Mock::given(method("GET"))
+        .and(path(RECENT))
+        .respond_with(ResponseTemplate::new(429))
+        .expect(8)
+        .mount(&server)
+        .await;
+
+    let mut t = NOW;
+    for expected_s in [60, 120, 240, 480, 960, 1920, 3600, 3600] {
+        let err = poll_user(&state, user, t).await.unwrap_err();
+        assert_eq!(err.kind(), "rate_limited");
+        assert_eq!(err.status(), Some(429));
+        assert_eq!(err.retry_after(), None);
+        let st = poll_state(&state, user).await;
+        let until = st.rate_limited_until_ms.unwrap();
+        assert_eq!(until - st.last_error_at_ms.unwrap(), expected_s * 1000);
+        // Not a millisecond early.
+        assert!(poll_all_users(&state, until - 1).await.is_empty());
+        t = until;
+    }
+}
+
+#[tokio::test]
+async fn interval_grows_when_idle_and_resets_on_new_plays() {
+    let (state, server) = setup().await;
+    let user = fresh_user(&state, "u1", "tok").await;
+    mock_recent(&server, "tok", vec![item("t1", &iso(NOW - 60_000), &["A"])]).await;
+    assert_eq!(poll_all_users(&state, NOW).await, [user]);
+    assert_scheduled(&poll_state(&state, user).await, NOW, MIN_INTERVAL_S);
+
+    server.reset().await;
+    mock_recent(&server, "tok", vec![]).await;
+    for expected in [240, 480, MAX_INTERVAL_S, MAX_INTERVAL_S] {
+        let due = poll_state(&state, user).await.next_poll_at_ms.unwrap();
+        assert!(poll_all_users(&state, due - 1).await.is_empty());
+        assert_eq!(poll_all_users(&state, due).await, [user]);
+        assert_scheduled(&poll_state(&state, user).await, due, expected);
     }
 
-    let mut blocked = HashMap::new();
-    poll_all_users(&state, &mut blocked).await;
-    assert_eq!(play_count(&state, good).await, 1);
-    assert!(blocked.contains_key(&bad));
+    server.reset().await;
+    mock_recent(
+        &server,
+        "tok",
+        vec![item("t2", &iso(NOW + 3_600_000), &["A"])],
+    )
+    .await;
+    let due = poll_state(&state, user).await.next_poll_at_ms.unwrap();
+    assert_eq!(poll_all_users(&state, due).await, [user]);
+    assert_eq!(play_count(&state, user).await, 2);
+    assert_scheduled(&poll_state(&state, user).await, due, MIN_INTERVAL_S);
+}
 
-    // While blocked, the rate-limited user is not called again.
-    let before = server.received_requests().await.unwrap().len();
-    poll_all_users(&state, &mut blocked).await;
-    let calls = &server.received_requests().await.unwrap()[before..];
-    assert!(
-        calls
-            .iter()
-            .all(|r| r.headers["authorization"] != "Bearer tok-bad")
+#[tokio::test]
+async fn full_page_polls_again_at_minimum_and_cursor_skips_no_readable_play() {
+    let (state, server) = setup().await;
+    let user = fresh_user(&state, "u1", "tok").await;
+    let history = History::default();
+    Mock::given(method("GET"))
+        .and(path(RECENT))
+        .respond_with(history.clone())
+        .mount(&server)
+        .await;
+    let base = NOW - 86_400_000;
+    let at = |i: i64| base + i * 180_000; // a play every 3 minutes
+
+    // 10 plays: less than a page.
+    for i in 0..10 {
+        history.play(at(i));
+    }
+    assert_eq!(poll_user(&state, user, NOW).await.unwrap(), 10);
+
+    // 70 more plays before the next poll: Spotify only keeps the last 50, so
+    // the page is full (the 20 oldest are gone for good, nobody can read them).
+    for i in 10..80 {
+        history.play(at(i));
+    }
+    set(&state, user, "poll_interval_secs", Some(MAX_INTERVAL_S)).await;
+    let t = NOW + 600_000;
+    assert_eq!(poll_user(&state, user, t).await.unwrap(), 50);
+    let st = poll_state(&state, user).await;
+    assert_eq!(st.last_polled_at_ms, Some(at(79)), "cursor = newest play");
+    assert_scheduled(&st, t, MIN_INTERVAL_S);
+
+    // 30 more: all of them come back after the cursor.
+    for i in 80..110 {
+        history.play(at(i));
+    }
+    let t = t + 600_000;
+    assert_eq!(poll_user(&state, user, t).await.unwrap(), 30);
+
+    // Every play Spotify still exposed at each poll was recorded.
+    let recorded: Vec<i64> =
+        sqlx::query_scalar("SELECT played_at FROM plays WHERE user_id = ?1 ORDER BY played_at")
+            .bind(user)
+            .fetch_all(&state.pool)
+            .await
+            .unwrap();
+    let expected: Vec<i64> = (0..10).chain(30..110).map(at).collect();
+    assert_eq!(recorded, expected);
+
+    // Each request's `after` was the newest play seen before it.
+    let afters: Vec<Option<String>> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| {
+            r.url
+                .query_pairs()
+                .find(|(k, _)| k == "after")
+                .map(|(_, v)| v.into_owned())
+        })
+        .collect();
+    assert_eq!(
+        afters,
+        [None, Some(at(9).to_string()), Some(at(79).to_string())]
     );
 }
 
 #[tokio::test]
-async fn spotify_revoked_token_fails_only_that_user() {
+async fn full_page_without_new_plays_still_polls_again_at_minimum() {
     let (state, server) = setup().await;
-    let bad = db::insert_test_user(&state.pool, "bad").await.unwrap(); // expired
+    let user = fresh_user(&state, "u1", "tok").await;
+    // The same full page every time (e.g. plays already imported).
+    let page: Vec<Value> = (0..50)
+        .map(|i| item(&format!("t{i}"), &iso(NOW - (i + 1) * 60_000), &["A"]))
+        .collect();
+    mock_recent(&server, "tok", page).await;
+
+    assert_eq!(poll_user(&state, user, NOW).await.unwrap(), 50);
+    set(&state, user, "poll_interval_secs", Some(MAX_INTERVAL_S)).await;
+    let t = NOW + 600_000;
+    assert_eq!(poll_user(&state, user, t).await.unwrap(), 0);
+    assert_scheduled(&poll_state(&state, user).await, t, MIN_INTERVAL_S);
+}
+
+#[tokio::test]
+async fn revoked_refresh_token_backs_off_that_user_until_they_log_in_again() {
+    let (state, server) = setup().await;
+    let bad = db::insert_test_user(&state.pool, "bad").await.unwrap(); // expired token
     let good = fresh_user(&state, "good", "tok-good").await;
+    set(&state, bad, "last_polled_at_ms", Some(CURSOR)).await;
     Mock::given(method("POST"))
         .and(path("/api/token"))
-        .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error":"invalid_grant"})))
+        .respond_with(ResponseTemplate::new(400).set_body_json(
+            json!({"error": "invalid_grant", "error_description": "Refresh token revoked"}),
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(RECENT))
+        .and(header("authorization", "Bearer access"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "items": [] })))
+        .expect(0)
         .mount(&server)
         .await;
     mock_recent(
@@ -236,12 +609,146 @@ async fn spotify_revoked_token_fails_only_that_user() {
     )
     .await;
 
-    assert!(matches!(
-        poll_user(&state, bad).await,
-        Err(PollError::Other(_))
-    ));
-    let mut blocked = HashMap::new();
-    poll_all_users(&state, &mut blocked).await;
+    assert_eq!(poll_all_users(&state, NOW).await, [bad, good]);
     assert_eq!(play_count(&state, good).await, 1);
     assert_eq!(play_count(&state, bad).await, 0);
+
+    let st = poll_state(&state, bad).await;
+    assert!(st.last_error.unwrap().contains("must log in again"));
+    let error_at = st.last_error_at_ms.unwrap();
+    assert_eq!(st.next_poll_at_ms, Some(error_at + 6 * 3_600_000));
+    assert_eq!(st.rate_limited_until_ms, None);
+    assert_eq!(st.last_polled_at_ms, Some(CURSOR), "cursor kept");
+
+    // Backed off: no call for hours (expect(1) on /api/token verified on drop).
+    assert_eq!(poll_all_users(&state, NOW + 5 * 3_600_000).await, [good]);
+
+    // A new login (fresh tokens), well before the 6 h are over, lifts the
+    // back-off at once.
+    let relogin = NOW + 5 * 3_600_000 + 600_000;
+    sqlx::query(
+        "UPDATE users SET access_token = 'relogged', refresh_token = 'refresh-2',
+                token_expires_at = ?1 WHERE id = ?2",
+    )
+    .bind(relogin / 1000 + 3600)
+    .bind(bad)
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    mock_recent(
+        &server,
+        "relogged",
+        vec![item("t2", "2024-01-01T11:00:00Z", &["B"])],
+    )
+    .await;
+    assert!(poll_all_users(&state, relogin).await.contains(&bad));
+    assert_eq!(play_count(&state, bad).await, 1);
+    assert_eq!(poll_state(&state, bad).await.last_error, None);
+}
+
+#[tokio::test]
+async fn unauthorized_marks_the_token_expired_without_retrying() {
+    let (state, server) = setup().await;
+    let user = fresh_user(&state, "u1", "stale").await;
+    Mock::given(method("GET"))
+        .and(path(RECENT))
+        .and(header("authorization", "Bearer stale"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(
+            json!({"error": {"status": 401, "message": "The access token expired"}}),
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    mock_token(&server, "renewed", 1).await;
+
+    let err = poll_user(&state, user, NOW).await.unwrap_err();
+    assert_eq!(err.kind(), "unauthorized");
+    assert_eq!(err.status(), Some(401));
+    // No refresh and no retry in the same poll.
+    assert_eq!(calls(&server).await.len(), 1);
+    let st = poll_state(&state, user).await;
+    assert_eq!(st.token_expires_at, 0, "token marked expired");
+    assert!(st.last_error.unwrap().contains("401"));
+
+    // The next poll refreshes the token first.
+    mock_recent(
+        &server,
+        "renewed",
+        vec![item("t1", "2024-01-01T10:00:00Z", &["A"])],
+    )
+    .await;
+    let due = st.next_poll_at_ms.unwrap();
+    assert!(poll_all_users(&state, due - 1).await.is_empty());
+    assert_eq!(poll_all_users(&state, due).await, [user]);
+    assert_eq!(play_count(&state, user).await, 1);
+    let seen = calls(&server).await;
+    assert_eq!(seen.len(), 3);
+    assert_eq!(seen[1].0, "/api/token");
+    assert_eq!(seen[2].1, "Bearer renewed");
+}
+
+#[tokio::test]
+async fn spotify_error_keeps_the_cursor_and_stores_a_short_message() {
+    let (state, server) = setup().await;
+    let user = fresh_user(&state, "u1", "secret-access-token").await;
+    set(&state, user, "last_polled_at_ms", Some(CURSOR)).await;
+    Mock::given(method("GET"))
+        .and(path(RECENT))
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+            "error": { "status": 503, "message": "x".repeat(1_000) },
+            "debug": "SECRET-BODY",
+        })))
+        .mount(&server)
+        .await;
+
+    let err = poll_user(&state, user, NOW).await.unwrap_err();
+    assert_eq!(err.kind(), "http_status");
+    assert_eq!(err.status(), Some(503));
+
+    let st = poll_state(&state, user).await;
+    assert_eq!(st.last_polled_at_ms, Some(CURSOR), "cursor kept");
+    assert_eq!(st.last_poll_ok_at_ms, None);
+    assert!((NOW..NOW + SLACK_MS).contains(&st.last_error_at_ms.unwrap()));
+    assert_eq!(play_count(&state, user).await, 0);
+    let message = st.last_error.clone().unwrap();
+    assert!(message.contains("503"), "{message}");
+    assert!(message.contains(&"x".repeat(200)), "{message}");
+    assert!(!message.contains(&"x".repeat(201)), "truncated: {message}");
+    assert!(!message.contains("SECRET-BODY"));
+    assert!(!message.contains("secret-access-token"));
+    // Backed off like an idle poll.
+    assert_scheduled(&st, NOW, 2 * MIN_INTERVAL_S);
+
+    // The next successful poll clears the error.
+    server.reset().await;
+    mock_recent(
+        &server,
+        "secret-access-token",
+        vec![item("t1", &iso(CURSOR + 1), &["A"])],
+    )
+    .await;
+    let due = st.next_poll_at_ms.unwrap();
+    assert_eq!(poll_all_users(&state, due).await, [user]);
+    let st = poll_state(&state, user).await;
+    assert_eq!(st.last_error, None);
+    assert_eq!(st.last_error_at_ms, None);
+    assert!(st.last_poll_ok_at_ms.unwrap() >= due);
+    assert_eq!(st.last_polled_at_ms, Some(CURSOR + 1));
+}
+
+#[tokio::test]
+async fn network_error_is_categorised_and_keeps_the_cursor() {
+    // Config::for_tests() points at port 1, where nothing listens.
+    let state = AppState::new(db::test_pool().await, Config::for_tests());
+    let user = fresh_user(&state, "u1", "tok").await;
+    set(&state, user, "last_polled_at_ms", Some(CURSOR)).await;
+
+    let err = poll_user(&state, user, NOW).await.unwrap_err();
+    assert_eq!(err.kind(), "network");
+    assert_eq!(err.status(), None);
+
+    let st = poll_state(&state, user).await;
+    assert_eq!(st.last_polled_at_ms, Some(CURSOR));
+    assert!(st.last_error.unwrap().contains("network error"));
+    assert_eq!(st.last_poll_ok_at_ms, None);
 }
