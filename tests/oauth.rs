@@ -60,7 +60,10 @@ async fn login(state: &AppState) -> (String, String) {
     assert_eq!(q["response_type"], "code");
     assert_eq!(q["client_id"], "test-client");
     assert_eq!(q["redirect_uri"], "http://127.0.0.1/callback");
-    assert_eq!(q["scope"], "user-read-recently-played user-read-private");
+    assert_eq!(
+        q["scope"],
+        "user-read-recently-played user-read-private user-read-currently-playing"
+    );
     let cookie = headers["set-cookie"].to_str().unwrap();
     let cookie = cookie.split(';').next().unwrap().to_string();
     (q["state"].clone(), cookie)
