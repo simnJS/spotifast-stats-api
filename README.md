@@ -139,7 +139,8 @@ docker compose up -d
 ## Publishing the image
 
 `.github/workflows/docker.yml` runs fmt, clippy and tests, then builds the image.
-Pull requests only build it (no push). Pushes to `main` publish
+Pull requests and pushes to other branches only build it (no push), which is
+how the Dockerfile is tested. Pushes to `main` publish
 `ghcr.io/<owner>/spotifast-stats-api` tagged `latest` and with the commit sha;
 `v*` tags also publish the version (e.g. `v1.2.3` gives `1.2.3`).
 
