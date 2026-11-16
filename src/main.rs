@@ -18,6 +18,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     tracing::info!(%bind_addr, "listening");
-    axum::serve(listener, app(state)).await?;
+    axum::serve(
+        listener,
+        app(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
