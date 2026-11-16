@@ -83,6 +83,29 @@ A new Spotify app starts in development mode:
 
 Use `ALLOWED_SPOTIFY_IDS` to restrict logins on your side as well.
 
+### Getting the image onto the server
+
+The image `ghcr.io/simnjs/spotifast-stats-api` only exists once the
+`Docker` workflow has run on a push to `main` (or on a `v*` tag). Until then,
+`docker compose pull` finds nothing; use `docker compose up -d --build` instead.
+
+A package published to GHCR from a personal account is created **private** by
+default, even if the repository is public (visibility is not inherited from the
+repository). Without a fix, `docker compose pull` on the server fails with
+`denied` / `unauthorized`. After the first successful publish, either:
+
+- make the package public: GitHub profile → **Packages** → `spotifast-stats-api`
+  → **Package settings** → **Danger Zone** → **Change visibility** → **Public**
+  (this cannot be undone; public images can be pulled anonymously); or
+- keep it private and log in on the server with a personal access token that has
+  the `read:packages` scope:
+
+  ```sh
+  echo "$GHCR_TOKEN" | docker login ghcr.io -u <github-username> --password-stdin
+  ```
+
+See GitHub's [Configuring a package's access control and visibility](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility).
+
 ### Updating
 
 ```sh
