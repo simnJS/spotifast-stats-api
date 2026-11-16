@@ -12,7 +12,12 @@ pub enum AppError {
     #[error("{0}")]
     Unauthorized(String),
     #[error("{0}")]
+    Forbidden(String),
+    #[error("{0}")]
     NotFound(String),
+    /// Too many requests from this client; the value is the `Retry-After` in seconds.
+    #[error("too many requests, retry in {0} s")]
+    TooManyRequests(u64),
     /// An upstream service (e.g. Spotify) failed.
     #[error("{0}")]
     BadGateway(String),
@@ -25,7 +30,9 @@ impl AppError {
         match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
+            Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -43,7 +50,14 @@ impl IntoResponse for AppError {
             }
             other => other.to_string(),
         };
-        (status, Json(json!({ "error": message }))).into_response()
+        let mut resp = (status, Json(json!({ "error": message }))).into_response();
+        if let Self::TooManyRequests(secs) = self {
+            resp.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from(secs),
+            );
+        }
+        resp
     }
 }
 
