@@ -1,6 +1,8 @@
 //! `GET /now-playing` tests, against a wiremock server and an in-memory DB.
 //! Each test has its own mock server, so the per-user in-memory cache (keyed by
-//! the Spotify API base) is never shared between tests.
+//! the Spotify API base and the user id) is never shared between tests.
+
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
@@ -30,6 +32,17 @@ async fn setup() -> Env {
     config.spotify_accounts_base = server.uri();
     let state = AppState::new(db::test_pool().await, config);
     let user_id = db::insert_test_user(&state.pool, "listener").await.unwrap();
+    // The cache is keyed by (API base, user id) and a freed wiremock port can be
+    // reused by a later test: give every test's user an id of its own.
+    static NEXT_ID: AtomicI64 = AtomicI64::new(1000);
+    let unique_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    sqlx::query("UPDATE users SET id = ?1 WHERE id = ?2")
+        .bind(unique_id)
+        .bind(user_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let user_id = unique_id;
     sqlx::query(
         "UPDATE users SET access_token = 'spotify-access', token_expires_at = ?1 WHERE id = ?2",
     )
