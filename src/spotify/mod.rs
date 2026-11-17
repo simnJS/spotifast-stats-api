@@ -4,6 +4,7 @@ mod client;
 mod now_playing;
 mod oauth;
 mod poller;
+pub mod rate_limit;
 
 use axum::Router;
 use axum::routing::get;

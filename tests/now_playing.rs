@@ -1,6 +1,7 @@
 //! `GET /now-playing` tests, against a wiremock server and an in-memory DB.
 //! Each test has its own mock server, so the per-user in-memory cache (keyed by
-//! the Spotify API base and the user id) is never shared between tests.
+//! the Spotify API base and the user id) is never shared between tests. The
+//! app-wide rate limit tests run on a simulated clock.
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -8,13 +9,18 @@ use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
+use spotifast_stats_api::clock::Clock;
 use spotifast_stats_api::config::Config;
+use spotifast_stats_api::spotify::poll_all_users;
 use spotifast_stats_api::{AppState, app, auth, db};
 use tower::ServiceExt;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const CURRENT: &str = "/v1/me/player/currently-playing";
+const RECENT: &str = "/v1/me/player/recently-played";
+/// Simulated "now": 2027-01-15T08:00:00Z, in unix ms.
+const NOW: i64 = 1_800_000_000_000;
 
 struct Env {
     state: AppState,
@@ -26,11 +32,16 @@ struct Env {
 
 /// A user whose Spotify access token (`spotify-access`) is valid for a day.
 async fn setup() -> Env {
+    setup_on(Clock::system()).await
+}
+
+/// [`setup`] on this clock.
+async fn setup_on(clock: Clock) -> Env {
     let server = MockServer::start().await;
     let mut config = Config::for_tests();
     config.spotify_api_base = format!("{}/v1", server.uri());
     config.spotify_accounts_base = server.uri();
-    let state = AppState::new(db::test_pool().await, config);
+    let state = AppState::new(db::test_pool().await, config).with_clock(clock);
     let user_id = db::insert_test_user(&state.pool, "listener").await.unwrap();
     // The cache is keyed by (API base, user id) and a freed wiremock port can be
     // reused by a later test: give every test's user an id of its own.
@@ -46,7 +57,7 @@ async fn setup() -> Env {
     sqlx::query(
         "UPDATE users SET access_token = 'spotify-access', token_expires_at = ?1 WHERE id = ?2",
     )
-    .bind(chrono::Utc::now().timestamp() + 86_400)
+    .bind(state.clock.now_ms() / 1000 + 86_400)
     .bind(user_id)
     .execute(&state.pool)
     .await
@@ -99,12 +110,22 @@ async fn mock_current(server: &MockServer, template: ResponseTemplate, calls: u6
         .await;
 }
 
-async fn rate_limited_until(env: &Env) -> Option<i64> {
-    sqlx::query_scalar("SELECT rate_limited_until_ms FROM users WHERE id = ?1")
-        .bind(env.user_id)
-        .fetch_one(&env.state.pool)
+/// The end of the app-wide Spotify rate limit stored in the database.
+async fn rate_limited_until(state: &AppState) -> Option<i64> {
+    sqlx::query_scalar("SELECT rate_limited_until_ms FROM app_state WHERE id = 1")
+        .fetch_one(&state.pool)
         .await
         .unwrap()
+}
+
+/// Store an app-wide block until `until_ms`, as a 429 anywhere would.
+async fn block_app(state: &AppState, until_ms: i64) {
+    sqlx::query("UPDATE app_state SET rate_limited_until_ms = ?1, rate_limited_at_ms = ?2")
+        .bind(until_ms)
+        .bind(state.clock.now_ms())
+        .execute(&state.pool)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -171,22 +192,87 @@ async fn nothing_playing_is_cached_too() {
 }
 
 #[tokio::test]
-async fn rate_limited_user_makes_no_call() {
-    let env = setup().await;
+async fn no_call_while_spotify_limits_the_app_even_after_a_restart() {
+    let env = setup_on(Clock::simulated(NOW)).await;
     // Not even a token refresh: expire the token, nothing must be sent.
-    sqlx::query("UPDATE users SET rate_limited_until_ms = ?1, token_expires_at = 0 WHERE id = ?2")
-        .bind(chrono::Utc::now().timestamp_millis() + 120_000)
+    sqlx::query("UPDATE users SET token_expires_at = 0 WHERE id = ?1")
         .bind(env.user_id)
         .execute(&env.state.pool)
         .await
         .unwrap();
+    // A 429 received by an earlier run (the poller, another user...).
+    block_app(&env.state, NOW + 120_000).await;
+    let env = Env {
+        state: AppState::new(env.state.pool.clone(), (*env.state.config).clone())
+            .with_clock(Clock::simulated(NOW)),
+        ..env
+    };
 
     let (status, headers, body) = get(&env, Some(&env.token)).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    let retry_after: u64 = headers["retry-after"].to_str().unwrap().parse().unwrap();
-    assert!((100..=120).contains(&retry_after), "{retry_after}");
+    assert_eq!(headers["retry-after"], "120");
     assert!(body["error"].is_string());
+    env.state.clock.set_ms(NOW + 119_001);
+    let (status, headers, _) = get(&env, Some(&env.token)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(headers["retry-after"], "1");
     assert!(env.server.received_requests().await.unwrap().is_empty());
+
+    // At its end, Spotify is asked again (token refresh, then the call).
+    Mock::given(method("POST"))
+        .and(path("/api/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(
+            json!({"access_token": "spotify-access", "expires_in": 3600, "token_type": "Bearer"}),
+        ))
+        .expect(1)
+        .mount(&env.server)
+        .await;
+    mock_current(&env.server, ResponseTemplate::new(204), 1).await;
+    env.state.clock.set_ms(NOW + 120_000);
+    let (status, _, _) = get(&env, Some(&env.token)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn a_429_here_stops_the_poller_for_every_user() {
+    let env = setup_on(Clock::simulated(NOW)).await;
+    let other = db::insert_test_user(&env.state.pool, "other")
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE users SET access_token = 'other-access', token_expires_at = ?1 WHERE id = ?2",
+    )
+    .bind(NOW / 1000 + 86_400)
+    .bind(other)
+    .execute(&env.state.pool)
+    .await
+    .unwrap();
+    mock_current(
+        &env.server,
+        ResponseTemplate::new(429).insert_header("Retry-After", "600"),
+        1,
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path(RECENT))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "items": [] })))
+        .expect(2)
+        .mount(&env.server)
+        .await;
+
+    let (status, headers, _) = get(&env, Some(&env.token)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(headers["retry-after"], "600");
+    assert_eq!(rate_limited_until(&env.state).await, Some(NOW + 600_000));
+
+    // Nobody is polled before the end of the block...
+    assert!(poll_all_users(&env.state, NOW + 599_999).await.is_empty());
+    assert_eq!(env.server.received_requests().await.unwrap().len(), 1);
+    // ...then everyone is (expect(2) on recently-played, verified on drop).
+    assert_eq!(
+        poll_all_users(&env.state, NOW + 600_000).await,
+        [env.user_id.min(other), env.user_id.max(other)]
+    );
 }
 
 #[tokio::test]
@@ -204,7 +290,7 @@ async fn a_429_is_stored_and_stops_further_calls() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     let retry_after: u64 = headers["retry-after"].to_str().unwrap().parse().unwrap();
     assert!((3_500..=3_600).contains(&retry_after), "{retry_after}");
-    let until = rate_limited_until(&env).await.unwrap();
+    let until = rate_limited_until(&env.state).await.unwrap();
     assert!(until >= before + 3_600_000, "{until}");
 
     // The deadline is stored: the next request makes no call (the mock allows one).

@@ -158,8 +158,8 @@ how the Dockerfile is tested. Pushes to `main` publish
 | Method | Path | Auth | Description |
 | --- | --- | --- | --- |
 | GET | `/health` | none | `{"status":"ok"}` when the database answers, 503 otherwise |
-| GET | `/auth/login` | none | Redirects the browser to Spotify's consent page (rate limited per IP); optional `app_redirect` and `app_state` for [desktop apps](#desktop-apps) |
-| GET | `/auth/callback` | none | Spotify redirects here; HTML page with the token in a browser, `{"token", "user"}` JSON otherwise, or a `302` to the desktop app's `app_redirect` |
+| GET | `/auth/login` | none | Redirects the browser to Spotify's consent page (rate limited per IP); optional `app_redirect` and `app_state` for [desktop apps](#desktop-apps); `503` while [Spotify rate limits the app](#when-spotify-rate-limits-the-app) |
+| GET | `/auth/callback` | none | Spotify redirects here; HTML page with the token in a browser, `{"token", "user"}` JSON otherwise, or a `302` to the desktop app's `app_redirect`; `503` while [Spotify rate limits the app](#when-spotify-rate-limits-the-app) |
 | GET | `/me` | Bearer | `id`, `spotify_id`, `display_name` |
 | GET | `/me/status` | Bearer | Poller state: last successful poll, next poll, current interval, rate limit, last error, play count |
 | DELETE | `/me` | Bearer | Deletes the account, its plays and its tokens |
@@ -175,7 +175,7 @@ how the Dockerfile is tested. Pushes to `main` publish
 | GET | `/stats/streaks` | Bearer | Current and longest run of consecutive listening days, in time zone `tz` |
 | GET | `/stats/compare?with=<user_id>` | Bearer | Artists and tracks in common with another user of the instance, and a similarity score |
 | GET | `/history` | Bearer | Plays, newest first |
-| GET | `/now-playing` | Bearer | What you are listening to right now (cached 30 s); 204 when nothing plays |
+| GET | `/now-playing` | Bearer | What you are listening to right now (cached 30 s); 204 when nothing plays; while Spotify rate limits the app, the last answer, or `503` with `Retry-After` |
 | POST | `/import` | Bearer | Imports a Spotify extended streaming history file, or the whole export zip |
 
 Authenticated routes expect `Authorization: Bearer <token>`. Errors are JSON:
@@ -241,8 +241,8 @@ letting that page overflow between two polls:
 - a full page (50 plays) means plays may have fallen out of it: the next poll
   is at the minimum, at once, and a warning is logged;
 - a poll without new plays (idle user) schedules the next one at the maximum;
-- when Spotify answers 429, that user is not called again before the
-  `Retry-After` delay, even across restarts (it is stored in the database);
+- when Spotify answers 429, nobody is polled before the end of the block
+  (see [below](#when-spotify-rate-limits-the-app));
 - the access token is refreshed only when it expires; if Spotify revokes it,
   the user must log in again (`/me/status` says so in `last_error`).
 
@@ -258,6 +258,26 @@ is used for paces above 96 s per play, where 25 plays take more than 40 min, and
 after an idle poll; then only someone skipping a track every 30 to 48 s for 40
 minutes straight could fill the page before the next poll, and the full-page
 warning would show it.
+
+### When Spotify rate limits the app
+
+Spotify's quota belongs to the app, not to a user, so a 429 on any call (the
+poller, `/now-playing`, a token refresh, a login) blocks the whole app: no call
+at all is sent to Spotify, for anyone, before `Retry-After` has passed (without
+a usable `Retry-After`: 1 min, doubled while the 429s follow one another, up to
+1 h). The end of the block is stored in the database, so it holds across
+restarts, and the log says so at startup. Meanwhile:
+
+- the poller skips its cycles; the users left are polled once the block is
+  over, and the cursor guarantees no play readable then is missed;
+- `/now-playing` answers its last cached answer, or `503` with `Retry-After`;
+- `/auth/login`, and `/auth/callback` when Spotify answers 429 during the
+  login (token exchange or profile), answer `503` with `Retry-After` and
+  « Spotify limite l’app jusqu’à HH:MM UTC » (the end, rounded up to the
+  minute, with the date when it is a day or more away): an HTML page for a
+  browser, `{"error": "..."}` otherwise. Nothing on it sends the browser back to
+  Spotify, so it cannot loop: log in again after that time. A desktop app's
+  callback gets the same message as `error` on its `app_redirect`.
 
 ### Query parameters
 

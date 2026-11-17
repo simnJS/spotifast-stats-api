@@ -9,6 +9,12 @@
 //! `app_state`. Both travel inside the signed cookie, and the callback then
 //! redirects to `app_redirect` with `token` (or `error`) and `state` instead of
 //! rendering the token page.
+//!
+//! While Spotify rate limits the app (see [`super::rate_limit`]), neither makes
+//! any Spotify call: they answer 503 with `Retry-After` and « Spotify limite
+//! l’app jusqu’à HH:MM UTC » (an HTML page for a browser, JSON otherwise), and
+//! nothing sends the browser back to Spotify, so it cannot loop. A 429 during
+//! the login itself (token exchange or profile) starts such a block.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -18,7 +24,9 @@ use std::time::{Duration, Instant};
 use axum::Json;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{ConnectInfo, Query, State};
-use axum::http::header::{ACCEPT, CACHE_CONTROL, CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE};
+use axum::http::header::{
+    ACCEPT, CACHE_CONTROL, CONTENT_TYPE, COOKIE, LOCATION, RETRY_AFTER, SET_COOKIE,
+};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -27,7 +35,8 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use super::client::{self, SCOPES};
+use super::client::{self, ClientError, SCOPES};
+use super::rate_limit;
 use crate::AppState;
 use crate::auth::issue_token;
 use crate::config::Config;
@@ -68,8 +77,8 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-fn now_secs() -> i64 {
-    chrono::Utc::now().timestamp()
+fn now_secs(state: &AppState) -> i64 {
+    state.clock.now_ms().div_euclid(1000)
 }
 
 fn cookie_attrs(state: &AppState) -> &'static str {
@@ -195,10 +204,23 @@ pub async fn login(
     let Query(params) = query.map_err(|e| AppError::BadRequest(e.body_text()))?;
     let app = app_target(params)?;
 
+    // The login would end in a Spotify call: not before the block ends.
+    let now_ms = state.clock.now_ms();
+    if let Some(until_ms) = rate_limit::blocked_until(&state.pool, now_ms).await? {
+        tracing::info!(
+            stage = "login",
+            "spotify login refused: Spotify limits the app"
+        );
+        return Ok(error_response(
+            &parts.headers,
+            rate_limit::blocked_error(until_ms, now_ms),
+        ));
+    }
+
     let mut bytes = [0u8; 16];
     rand::rng().fill_bytes(&mut bytes);
     let nonce = hex::encode(bytes);
-    let expires = now_secs() + STATE_TTL_SECS;
+    let expires = now_secs(&state) + STATE_TTL_SECS;
     let msg = state_message(&nonce, expires, app.as_ref());
     let cookie = format!(
         "{COOKIE_NAME}={msg}.{}; Max-Age={STATE_TTL_SECS}{}",
@@ -263,7 +285,7 @@ fn verify_state(app: &AppState, headers: &HeaderMap, state_param: &str) -> Optio
         }),
         _ => return None,
     };
-    (expires >= now_secs() && constant_time_eq(nonce.as_bytes(), state_param.as_bytes()))
+    (expires >= now_secs(app) && constant_time_eq(nonce.as_bytes(), state_param.as_bytes()))
         .then_some(VerifiedState { app: target })
 }
 
@@ -318,6 +340,44 @@ code,pre{{background:#eee;padding:.2rem .4rem;border-radius:4px;word-break:break
 <p>Try it:</p><pre>curl -H \"Authorization: Bearer {token}\" https://YOUR-SERVER/stats/summary</pre>\
 </body></html>\n"
     )
+}
+
+/// The page shown while Spotify rate limits the app. Nothing on it sends the
+/// browser anywhere (no redirect, no refresh, no script): it cannot loop.
+fn rate_limited_page(message: &str) -> String {
+    let message = html_escape(message);
+    format!(
+        "<!doctype html>\n<html lang=\"fr\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+<title>Spotify limite l’app</title>\
+<style>body{{font-family:system-ui,sans-serif;max-width:40rem;margin:2rem auto;padding:0 1rem}}</style>\
+</head><body><h1>{message}</h1>\
+<p>Spotify refuse pour le moment les appels de cette app (HTTP 429), pour tous ses \
+utilisateurs : la connexion ne peut pas aboutir avant cette heure. Recommencez-la ensuite.</p>\
+</body></html>\n"
+    )
+}
+
+/// An error answer of the login: [`rate_limited_page`] for a browser while
+/// Spotify rate limits the app, the JSON error otherwise.
+fn error_response(headers: &HeaderMap, err: AppError) -> Response {
+    match err {
+        AppError::SpotifyRateLimited {
+            message,
+            retry_after_secs,
+        } if wants_html(headers) => {
+            let mut resp = (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(CONTENT_TYPE, "text/html; charset=utf-8")],
+                rate_limited_page(&message),
+            )
+                .into_response();
+            resp.headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from(retry_after_secs));
+            resp
+        }
+        other => other.into_response(),
+    }
 }
 
 /// A finished login.
@@ -385,7 +445,7 @@ pub async fn callback(
         (Some(app), Ok(login)) => redirect_to_app(&app, "token", &login.token),
         (Some(app), Err(e)) => redirect_to_app(&app, "error", &e.public_message()),
         (None, Ok(login)) => Ok(token_response(headers, &login)),
-        (None, Err(e)) => return e.into_response(),
+        (None, Err(e)) => return error_response(headers, e),
     };
     resp.and_then(|r| no_store_and_clear_cookie(&state, r))
         .unwrap_or_else(IntoResponse::into_response)
@@ -425,16 +485,39 @@ async fn finish_login(
         ));
     };
 
-    let tokens = client::exchange_code(state, &code).await.map_err(|e| {
+    let db_fail = |e: sqlx::Error| {
+        let cause = e.to_string();
         fail(
-            "token exchange",
-            &e,
-            AppError::BadGateway(format!(
+            "database",
+            &cause,
+            AppError::BadGateway("could not save your login, please try again".into()),
+        )
+    };
+
+    // No Spotify call at all while Spotify rate limits the app.
+    let now_ms = state.clock.now_ms();
+    if let Some(until_ms) = rate_limit::blocked_until(&state.pool, now_ms)
+        .await
+        .map_err(db_fail)?
+    {
+        return Err(fail(
+            "rate limit",
+            &"Spotify rate limits the app, no call made",
+            rate_limit::blocked_error(until_ms, now_ms),
+        ));
+    }
+
+    let tokens = match client::exchange_code(state, &code).await {
+        Ok(tokens) => tokens,
+        Err(e) => {
+            let other = AppError::BadGateway(format!(
                 "Spotify refused the authorization code (token exchange failed: {e}). \
                  Try logging in again."
-            )),
-        )
-    })?;
+            ));
+            let shown = call_error(state, &e, other).await;
+            return Err(fail("token exchange", &e, shown));
+        }
+    };
     let Some(refresh) = tokens.refresh_token else {
         return Err(fail(
             "token exchange",
@@ -442,19 +525,18 @@ async fn finish_login(
             AppError::BadGateway("Spotify returned no refresh token".into()),
         ));
     };
-    let profile = client::get_profile(state, &tokens.access_token)
-        .await
-        .map_err(|e| {
-            fail(
-                "profile",
-                &e,
-                AppError::BadGateway(format!(
-                    "Spotify refused the profile request ({e}). If your Spotify account \
-                     is not the app owner's, it may need to be added to the app's user \
-                     list in the Spotify developer dashboard."
-                )),
-            )
-        })?;
+    let profile = match client::get_profile(state, &tokens.access_token).await {
+        Ok(profile) => profile,
+        Err(e) => {
+            let other = AppError::BadGateway(format!(
+                "Spotify refused the profile request ({e}). If your Spotify account \
+                 is not the app owner's, it may need to be added to the app's user \
+                 list in the Spotify developer dashboard."
+            ));
+            let shown = call_error(state, &e, other).await;
+            return Err(fail("profile", &e, shown));
+        }
+    };
 
     if let Some(allowed) = &state.config.allowed_spotify_ids
         && !allowed.iter().any(|id| id == &profile.id)
@@ -470,19 +552,9 @@ async fn finish_login(
         .display_name
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| profile.id.clone());
-    let expires_at = now_secs() + tokens.expires_in;
+    let expires_at = now_secs(state) + tokens.expires_in;
 
-    let db_fail = |e: sqlx::Error| {
-        let cause = e.to_string();
-        fail(
-            "database",
-            &cause,
-            AppError::BadGateway("could not save your login, please try again".into()),
-        )
-    };
-
-    // A (re-)login also clears the poller backoff so polling resumes promptly;
-    // `rate_limited_until_ms` is Spotify's quota and is left alone.
+    // A (re-)login also clears the poller backoff so polling resumes promptly.
     let (user_id,): (i64,) = sqlx::query_as(
         "INSERT INTO users (spotify_id, display_name, access_token, refresh_token, token_expires_at)
          VALUES (?1, ?2, ?3, ?4, ?5)
@@ -512,6 +584,20 @@ async fn finish_login(
         spotify_id: profile.id,
         display_name,
     })
+}
+
+/// The error to show for a failed Spotify call of the login: a 429 blocks the
+/// whole app (stored, see [`rate_limit::record_429`]) and says until when;
+/// anything else is `other`.
+async fn call_error(state: &AppState, e: &ClientError, other: AppError) -> AppError {
+    match e {
+        ClientError::RateLimited { retry_after } => {
+            let at_ms = state.clock.now_ms();
+            let until_ms = rate_limit::record_429(&state.pool, *retry_after, at_ms).await;
+            rate_limit::blocked_error(until_ms, at_ms)
+        }
+        _ => other,
+    }
 }
 
 // ---- per-IP rate limit ----------------------------------------------------

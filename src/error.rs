@@ -21,6 +21,13 @@ pub enum AppError {
     /// An upstream service (e.g. Spotify) failed.
     #[error("{0}")]
     BadGateway(String),
+    /// Spotify rate limits the whole app (HTTP 429): 503, with the message
+    /// saying until when and the `Retry-After` in seconds.
+    #[error("{message}")]
+    SpotifyRateLimited {
+        message: String,
+        retry_after_secs: u64,
+    },
     #[error("{0}")]
     Internal(String),
 }
@@ -34,7 +41,19 @@ impl AppError {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
+            Self::SpotifyRateLimited { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    /// The `Retry-After` of this error, in seconds, when it has one.
+    pub fn retry_after_secs(&self) -> Option<u64> {
+        match self {
+            Self::TooManyRequests(secs) => Some(*secs),
+            Self::SpotifyRateLimited {
+                retry_after_secs, ..
+            } => Some(*retry_after_secs),
+            _ => None,
         }
     }
 
@@ -55,7 +74,7 @@ impl IntoResponse for AppError {
         }
         let message = self.public_message();
         let mut resp = (status, Json(json!({ "error": message }))).into_response();
-        if let Self::TooManyRequests(secs) = self {
+        if let Some(secs) = self.retry_after_secs() {
             resp.headers_mut().insert(
                 axum::http::header::RETRY_AFTER,
                 axum::http::HeaderValue::from(secs),

@@ -6,8 +6,8 @@
 //! table (see `migrations/0002_poller_state_and_token_usage.sql` and
 //! `migrations/0003_adaptive_poller.sql`), so it survives a restart:
 //! - the scheduler wakes up every [`TICK`] and polls, one user after the other,
-//!   only the users that are due (`next_poll_at_ms` NULL or past) and not rate
-//!   limited (`rate_limited_until_ms` NULL or past);
+//!   only the users that are due (`next_poll_at_ms` NULL or past), and nobody
+//!   while Spotify rate limits the app (see [`super::rate_limit`]);
 //! - a poll makes at most one `recently-played` call, with `after` = the cursor
 //!   (`last_polled_at_ms`), preceded by a token refresh only when the access
 //!   token expires within [`REFRESH_MARGIN_SECS`];
@@ -21,16 +21,19 @@
 //!   (with a warning: plays may have fallen out of the page), a poll without new
 //!   plays goes to the maximum, and every poll is scheduled with ±10 % jitter
 //!   (`next_poll_at_ms`);
-//! - a 429 stores `rate_limited_until_ms` = now + `Retry-After` (or an
-//!   exponential back-off without one) for that user only: nothing at all, not
-//!   even a token refresh, is sent for that user before then.
+//! - a 429 blocks the whole app until now + `Retry-After` (or an exponential
+//!   back-off without one), stored in the database: nothing at all, not even a
+//!   token refresh, is sent to Spotify for anyone before then, and the cycle
+//!   stops at once.
 
 use std::time::{Duration, Instant};
 
 use rand::Rng;
 
 use super::client::{self, ClientError, RECENTLY_PLAYED_LIMIT};
+use super::rate_limit;
 use crate::AppState;
+use crate::clock::fmt_ms;
 use crate::config::Config;
 use crate::db::{PlaySource, insert_play, upsert_track};
 
@@ -39,11 +42,6 @@ use crate::db::{PlaySource, insert_play, upsert_track};
 const TICK: Duration = Duration::from_secs(15);
 /// Refresh the access token when it expires within this many seconds.
 const REFRESH_MARGIN_SECS: i64 = 60;
-/// Back-off after a 429 without a usable `Retry-After`: this much first, then
-/// doubled while the 429s keep coming...
-const RATE_LIMIT_BACKOFF_MIN_MS: i64 = 60_000;
-/// ...up to this much.
-const RATE_LIMIT_BACKOFF_MAX_MS: i64 = 3_600_000;
 /// Back-off after Spotify refused the refresh token.
 const REVOKED_BACKOFF_MS: i64 = 6 * 3_600_000;
 /// Every scheduled poll is moved by up to this fraction of the interval.
@@ -63,8 +61,8 @@ const RELOGIN_ERROR: &str = "Spotify refused the refresh token (invalid_grant): 
 /// Why polling one user failed.
 #[derive(Debug)]
 pub enum PollError {
-    /// A 429 stored earlier still holds until `until_ms`: nothing was sent to
-    /// Spotify and nothing was recorded.
+    /// Spotify rate limits the app until `until_ms` (a 429 stored earlier, for
+    /// any user): nothing was sent to Spotify and nothing was recorded.
     StillRateLimited { until_ms: i64 },
     /// A Spotify call failed (token refresh or recently-played).
     Spotify(ClientError),
@@ -140,15 +138,13 @@ pub(super) struct UserState {
     poll_interval_secs: Option<i64>,
     /// Smoothed pace, in seconds per play (NULL = not measured yet).
     secs_per_play: Option<f64>,
-    pub(super) rate_limited_until_ms: Option<i64>,
-    last_error_at_ms: Option<i64>,
 }
 
 impl UserState {
     pub(super) async fn load(state: &AppState, user_id: i64) -> Result<Self, sqlx::Error> {
         sqlx::query_as(
             "SELECT access_token, refresh_token, token_expires_at, last_polled_at_ms,
-                    poll_interval_secs, secs_per_play, rate_limited_until_ms, last_error_at_ms
+                    poll_interval_secs, secs_per_play
              FROM users WHERE id = ?1",
         )
         .bind(user_id)
@@ -188,16 +184,14 @@ struct Schedule {
 /// stored on the user row; a failure leaves the cursor alone.
 ///
 /// Returns the number of newly recorded plays. Refuses, without any call, while
-/// the user is rate limited.
+/// Spotify rate limits the app.
 pub async fn poll_user(state: &AppState, user_id: i64, now_ms: i64) -> Result<usize, PollError> {
     let started = Instant::now();
-    let user = UserState::load(state, user_id).await?;
-    if let Some(until_ms) = user.rate_limited_until_ms
-        && until_ms > now_ms
-    {
-        tracing::debug!(user_id, until = %fmt_ms(until_ms), "poller: still rate limited, no call");
+    if let Some(until_ms) = rate_limit::blocked_until(&state.pool, now_ms).await? {
+        tracing::debug!(user_id, until = %fmt_ms(until_ms), "poller: Spotify limits the app, no call");
         return Err(PollError::StillRateLimited { until_ms });
     }
+    let user = UserState::load(state, user_id).await?;
 
     let fetched = fetch(state, user_id, &user, now_ms).await;
     // Outcome times include the time spent waiting for Spotify, so a deadline
@@ -403,7 +397,7 @@ async fn record_success(
     sqlx::query(
         "UPDATE users SET last_polled_at_ms = ?1, poll_interval_secs = ?2, next_poll_at_ms = ?3,
                 last_poll_ok_at_ms = ?4, last_error = NULL, last_error_at_ms = NULL,
-                rate_limited_until_ms = NULL, secs_per_play = ?5
+                secs_per_play = ?5
          WHERE id = ?6",
     )
     .bind(fetched.newest)
@@ -424,8 +418,8 @@ async fn record_success(
 /// Store a failed poll; returns the earliest time of the next call for this user.
 ///
 /// The cursor is left alone. Then:
-/// - 429: `rate_limited_until_ms` = now + `Retry-After`, or the exponential
-///   back-off without a usable one;
+/// - 429: the whole app is blocked ([`rate_limit::record_429`]) and this user's
+///   next poll is at the end of the block;
 /// - refresh token refused: [`RELOGIN_ERROR`], next poll in 6 h;
 /// - 401: the access token is marked expired, so the next poll refreshes it;
 /// - anything else: the interval doubles, up to the maximum.
@@ -439,18 +433,18 @@ pub(super) async fn record_failure(
     let (min, max) = interval_bounds(&state.config);
     let current = current_interval(user, min, max);
     let mut interval = current;
-    let mut rate_limited_until_ms = None;
     let mut expire_token = false;
     let (next_poll_at_ms, last_error) = match err {
         PollError::StillRateLimited { until_ms } => return *until_ms,
         PollError::Spotify(ClientError::RateLimited { retry_after }) => {
-            let wait_ms = match retry_after {
-                Some(d) => duration_ms(*d),
-                None => rate_limit_backoff_ms(user.rate_limited_until_ms, user.last_error_at_ms),
-            };
-            let until = at_ms.saturating_add(wait_ms);
-            rate_limited_until_ms = Some(until);
-            (until, format!("{err}; no call before {}", fmt_ms(until)))
+            let until = rate_limit::record_429(&state.pool, *retry_after, at_ms).await;
+            (
+                until,
+                format!(
+                    "{err}; no call to Spotify, for any user, before {}",
+                    fmt_ms(until)
+                ),
+            )
         }
         PollError::Spotify(ClientError::InvalidGrant) => (
             at_ms.saturating_add(REVOKED_BACKOFF_MS),
@@ -470,15 +464,13 @@ pub(super) async fn record_failure(
     };
     let stored = sqlx::query(
         "UPDATE users SET
-             rate_limited_until_ms = COALESCE(?1, rate_limited_until_ms),
-             next_poll_at_ms = ?2,
-             poll_interval_secs = ?3,
-             token_expires_at = CASE WHEN ?4 THEN 0 ELSE token_expires_at END,
-             last_error = ?5,
-             last_error_at_ms = ?6
-         WHERE id = ?7",
+             next_poll_at_ms = ?1,
+             poll_interval_secs = ?2,
+             token_expires_at = CASE WHEN ?3 THEN 0 ELSE token_expires_at END,
+             last_error = ?4,
+             last_error_at_ms = ?5
+         WHERE id = ?6",
     )
-    .bind(rate_limited_until_ms)
     .bind(next_poll_at_ms)
     .bind(interval)
     .bind(expire_token)
@@ -493,7 +485,7 @@ pub(super) async fn record_failure(
     next_poll_at_ms
 }
 
-/// Users to poll at `now_ms`: not rate limited, and due.
+/// Users to poll at `now_ms`: the due ones.
 ///
 /// Due means `next_poll_at_ms` NULL or past. A user backed off because the
 /// refresh token was refused is due again as soon as they log in again: their
@@ -502,9 +494,8 @@ pub(super) async fn record_failure(
 async fn due_users(state: &AppState, now_ms: i64) -> Result<Vec<i64>, sqlx::Error> {
     sqlx::query_scalar(
         "SELECT id FROM users
-         WHERE (rate_limited_until_ms IS NULL OR rate_limited_until_ms <= ?1)
-           AND (next_poll_at_ms IS NULL OR next_poll_at_ms <= ?1
-                OR (last_error = ?2 AND token_expires_at * 1000 > last_error_at_ms + ?3))
+         WHERE next_poll_at_ms IS NULL OR next_poll_at_ms <= ?1
+            OR (last_error = ?2 AND token_expires_at * 1000 > last_error_at_ms + ?3)
          ORDER BY id",
     )
     .bind(now_ms)
@@ -516,11 +507,24 @@ async fn due_users(state: &AppState, now_ms: i64) -> Result<Vec<i64>, sqlx::Erro
 
 /// One scheduler cycle at `now_ms` (unix ms).
 ///
-/// Polls, one after the other, the users that are due. A failure for one user
-/// is logged and recorded by [`poll_user`] and never stops the others. Returns
-/// the ids of the users polled.
+/// Polls, one after the other, the users that are due; nobody while Spotify
+/// rate limits the app. A failure for one user is logged and recorded by
+/// [`poll_user`] and does not stop the others, except a 429 (or a block stored
+/// meanwhile by `/now-playing` or a login): the cycle stops there, the users
+/// left stay due. Returns the ids of the users polled.
 pub async fn poll_all_users(state: &AppState, now_ms: i64) -> Vec<i64> {
     let started = Instant::now();
+    match rate_limit::blocked_until(&state.pool, now_ms).await {
+        Ok(None) => {}
+        Ok(Some(until_ms)) => {
+            tracing::debug!(until = %fmt_ms(until_ms), "poller: Spotify limits the app, nobody is polled");
+            return Vec::new();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "poller: cannot read the Spotify rate limit");
+            return Vec::new();
+        }
+    }
     let due = match due_users(state, now_ms).await {
         Ok(ids) => ids,
         Err(e) => {
@@ -528,16 +532,25 @@ pub async fn poll_all_users(state: &AppState, now_ms: i64) -> Vec<i64> {
             return Vec::new();
         }
     };
-    for &user_id in &due {
+    let mut polled = Vec::with_capacity(due.len());
+    for user_id in due {
         // Earlier polls of this cycle took time: keep each user's clock right.
         let user_now_ms = now_ms.saturating_add(elapsed_ms(started));
-        let _ = poll_user(state, user_id, user_now_ms).await;
+        match poll_user(state, user_id, user_now_ms).await {
+            Err(PollError::StillRateLimited { .. }) => break,
+            Err(PollError::Spotify(ClientError::RateLimited { .. })) => {
+                polled.push(user_id);
+                break;
+            }
+            _ => polled.push(user_id),
+        }
     }
-    due
+    polled
 }
 
 /// Start the background poller that records plays for every user.
-/// Called once from `main`.
+/// Called once from `main`; first says whether a Spotify rate limit stored by a
+/// previous run still holds.
 pub fn spawn_poller(state: AppState) {
     let tick = TICK.min(Duration::from_secs(state.config.poll_interval_secs.max(1)));
     let (min, max) = interval_bounds(&state.config);
@@ -548,11 +561,20 @@ pub fn spawn_poller(state: AppState) {
         "poller started"
     );
     tokio::spawn(async move {
+        match rate_limit::blocked_until(&state.pool, state.clock.now_ms()).await {
+            Ok(Some(until_ms)) => tracing::warn!(
+                until = %fmt_ms(until_ms),
+                "poller: Spotify still rate limits the app (stored 429), no call to Spotify \
+                 before the end of the block"
+            ),
+            Ok(None) => {}
+            Err(e) => tracing::error!(error = %e, "poller: cannot read the Spotify rate limit"),
+        }
         let mut ticker = tokio::time::interval(tick);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            poll_all_users(&state, chrono::Utc::now().timestamp_millis()).await;
+            poll_all_users(&state, state.clock.now_ms()).await;
         }
     });
 }
@@ -636,42 +658,14 @@ pub(crate) fn round_tenth(secs: f64) -> f64 {
     (secs * 10.0).round() / 10.0
 }
 
-/// Back-off after a 429 without a usable `Retry-After`.
-///
-/// 60 s, doubled while the 429s follow one another, capped at 1 h. The previous
-/// back-off is `rate_limited_until_ms - last_error_at_ms`, both written by the
-/// previous 429 (a success clears the deadline, another error moves the error
-/// time past it).
-fn rate_limit_backoff_ms(previous_until_ms: Option<i64>, previous_error_at_ms: Option<i64>) -> i64 {
-    match (previous_until_ms, previous_error_at_ms) {
-        (Some(until), Some(at)) if until > at => until
-            .saturating_sub(at)
-            .saturating_mul(2)
-            .clamp(RATE_LIMIT_BACKOFF_MIN_MS, RATE_LIMIT_BACKOFF_MAX_MS),
-        _ => RATE_LIMIT_BACKOFF_MIN_MS,
-    }
-}
-
 /// `interval_secs` in milliseconds, ±[`JITTER`].
 fn jittered_ms(interval_secs: i64) -> i64 {
     let factor: f64 = rand::rng().random_range((1.0 - JITTER)..=(1.0 + JITTER));
     (interval_secs as f64 * 1000.0 * factor).round() as i64
 }
 
-fn duration_ms(d: Duration) -> i64 {
-    i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
-}
-
 fn elapsed_ms(since: Instant) -> i64 {
-    duration_ms(since.elapsed())
-}
-
-/// Unix ms as RFC 3339, for logs and messages.
-fn fmt_ms(ms: i64) -> String {
-    chrono::DateTime::from_timestamp_millis(ms).map_or_else(
-        || format!("{ms} ms"),
-        |t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-    )
+    i64::try_from(since.elapsed().as_millis()).unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]
@@ -725,33 +719,10 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_backoff_starts_at_a_minute_doubles_and_caps_at_an_hour() {
-        assert_eq!(rate_limit_backoff_ms(None, None), 60_000);
-        assert_eq!(
-            rate_limit_backoff_ms(Some(1_060_000), Some(1_000_000)),
-            120_000
-        );
-        assert_eq!(
-            rate_limit_backoff_ms(Some(3_400_000), Some(1_000_000)),
-            3_600_000
-        );
-        // The deadline predates the last error: not a run of 429s, start over.
-        assert_eq!(
-            rate_limit_backoff_ms(Some(1_000_000), Some(2_000_000)),
-            60_000
-        );
-    }
-
-    #[test]
     fn jitter_stays_within_ten_percent() {
         for _ in 0..1_000 {
             let ms = jittered_ms(120);
             assert!((108_000..=132_000).contains(&ms), "{ms}");
         }
-    }
-
-    #[test]
-    fn times_are_formatted_as_rfc3339() {
-        assert_eq!(fmt_ms(1_800_000_000_000), "2027-01-15T08:00:00Z");
     }
 }

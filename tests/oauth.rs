@@ -6,6 +6,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
+use spotifast_stats_api::clock::Clock;
 use spotifast_stats_api::config::Config;
 use spotifast_stats_api::{AppState, app, db};
 use tower::ServiceExt;
@@ -309,14 +310,13 @@ async fn profile_refused_hints_at_dashboard_user_list() {
 }
 
 #[tokio::test]
-async fn relogin_resets_poller_state_but_keeps_rate_limit() {
+async fn relogin_resets_poller_state() {
     let (state, server) = setup().await;
     mock_oauth(&server, "sp-user", json!("Spo"), "refresh-1").await;
     let (status, _) = do_callback(&state).await;
     assert_eq!(status, StatusCode::OK);
     sqlx::query(
-        "UPDATE users SET next_poll_at_ms = 111, last_error = 'boom', \
-         last_error_at_ms = 222, rate_limited_until_ms = 333",
+        "UPDATE users SET next_poll_at_ms = 111, last_error = 'boom', last_error_at_ms = 222",
     )
     .execute(&state.pool)
     .await
@@ -324,13 +324,12 @@ async fn relogin_resets_poller_state_but_keeps_rate_limit() {
 
     let (status, _) = do_callback(&state).await;
     assert_eq!(status, StatusCode::OK);
-    let row: (Option<i64>, Option<String>, Option<i64>, Option<i64>) = sqlx::query_as(
-        "SELECT next_poll_at_ms, last_error, last_error_at_ms, rate_limited_until_ms FROM users",
-    )
-    .fetch_one(&state.pool)
-    .await
-    .unwrap();
-    assert_eq!(row, (None, None, None, Some(333)));
+    let row: (Option<i64>, Option<String>, Option<i64>) =
+        sqlx::query_as("SELECT next_poll_at_ms, last_error, last_error_at_ms FROM users")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    assert_eq!(row, (None, None, None));
 }
 
 #[tokio::test]
@@ -648,4 +647,172 @@ async fn app_redirect_in_the_cookie_cannot_be_tampered_with() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(headers.get("location").is_none());
     assert_eq!(user_count(&state).await, 0);
+}
+
+// ---- while Spotify rate limits the app (HTTP 429) ---------------------------
+
+/// Simulated "now": 2027-01-15T08:00:00Z, in unix ms.
+const NOW: i64 = 1_800_000_000_000;
+const HTML: (&str, &str) = ("accept", "text/html,application/xhtml+xml,*/*;q=0.8");
+const JSON: (&str, &str) = ("accept", "application/json");
+
+/// [`setup`] on a clock stopped at [`NOW`].
+async fn setup_at_now() -> (AppState, MockServer) {
+    let (state, server) = setup().await;
+    (state.with_clock(Clock::simulated(NOW)), server)
+}
+
+/// Store an app-wide block until `until_ms`, as a 429 anywhere would.
+async fn block_app(state: &AppState, until_ms: i64) {
+    sqlx::query("UPDATE app_state SET rate_limited_until_ms = ?1, rate_limited_at_ms = ?2")
+        .bind(until_ms)
+        .bind(NOW)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+}
+
+async fn rate_limited_until(state: &AppState) -> Option<i64> {
+    sqlx::query_scalar("SELECT rate_limited_until_ms FROM app_state WHERE id = 1")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap()
+}
+
+/// The rate limit page: 503, `Retry-After`, the message, and nothing that
+/// sends the browser anywhere (so it cannot loop).
+fn assert_rate_limit_page(
+    status: StatusCode,
+    headers: &axum::http::HeaderMap,
+    html: &str,
+    message: &str,
+    retry_after: &str,
+) {
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{html}");
+    assert_eq!(headers["retry-after"], retry_after);
+    assert!(
+        headers["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html")
+    );
+    assert!(html.contains(&format!("<h1>{message}</h1>")), "{html}");
+    assert!(headers.get("location").is_none());
+    assert!(headers.get("refresh").is_none());
+    assert!(headers.get("set-cookie").is_none());
+    for way_back in ["http-equiv", "<script", "href", "/auth/"] {
+        assert!(!html.contains(way_back), "{way_back} in {html}");
+    }
+}
+
+/// The same as JSON: 503, `Retry-After` and `{"error": message}`.
+fn assert_rate_limit_json(
+    status: StatusCode,
+    headers: &axum::http::HeaderMap,
+    body: &str,
+    message: &str,
+    retry_after: &str,
+) {
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(headers["retry-after"], retry_after);
+    let body: Value = serde_json::from_str(body).unwrap();
+    assert_eq!(body, json!({ "error": message }));
+    assert!(headers.get("location").is_none());
+}
+
+#[tokio::test]
+async fn login_shows_until_when_spotify_limits_the_app_without_calling_it() {
+    let (state, server) = setup_at_now().await;
+    // 08:10:30 UTC: shown as 08:11, never earlier than the real end.
+    block_app(&state, NOW + 630_000).await;
+    let message = "Spotify limite l’app jusqu’à 08:11 UTC";
+
+    let (status, headers, html) = raw(&state, req_with("/auth/login", None, &[HTML])).await;
+    assert_rate_limit_page(status, &headers, &html, message, "630");
+    let (status, headers, body) = raw(&state, req_with("/auth/login", None, &[JSON])).await;
+    assert_rate_limit_json(status, &headers, &body, message, "630");
+    // A desktop app's login is refused the same way.
+    let uri = login_uri(&[("app_redirect", "http://127.0.0.1:4321/cb")]);
+    let (status, headers, html) = raw(&state, req_with(&uri, None, &[HTML])).await;
+    assert_rate_limit_page(status, &headers, &html, message, "630");
+
+    state.clock.set_ms(NOW + 629_001);
+    let (status, headers, _) = raw(&state, req_with("/auth/login", None, &[JSON])).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(headers["retry-after"], "1");
+    assert!(server.received_requests().await.unwrap().is_empty());
+
+    // Once the block is over, the login goes to Spotify again.
+    state.clock.set_ms(NOW + 630_000);
+    login(&state).await;
+}
+
+#[tokio::test]
+async fn profile_429_blocks_the_app_and_the_callback_shows_until_when() {
+    let (state, server) = setup_at_now().await;
+    Mock::given(method("POST"))
+        .and(path("/api/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "access-1", "token_type": "Bearer", "expires_in": 3600,
+            "refresh_token": "r",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/me"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "120"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let message = "Spotify limite l’app jusqu’à 08:02 UTC";
+    let (st, cookie) = login(&state).await;
+    let callback = format!("/auth/callback?code=the-code&state={st}");
+
+    let (status, headers, html) = raw(&state, req_with(&callback, Some(&cookie), &[HTML])).await;
+    assert_rate_limit_page(status, &headers, &html, message, "120");
+    assert_eq!(rate_limited_until(&state).await, Some(NOW + 120_000));
+    assert_eq!(user_count(&state).await, 0);
+
+    // During the block, neither the same callback again nor a new login calls
+    // Spotify (expect(1) on both mocks, verified on drop).
+    let (status, headers, body) = raw(&state, req_with(&callback, Some(&cookie), &[JSON])).await;
+    assert_rate_limit_json(status, &headers, &body, message, "120");
+    let (status, headers, html) = raw(&state, req_with("/auth/login", None, &[HTML])).await;
+    assert_rate_limit_page(status, &headers, &html, message, "120");
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn token_exchange_429_is_sent_to_the_desktop_app() {
+    let (state, server) = setup_at_now().await;
+    Mock::given(method("POST"))
+        .and(path("/api/token"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "60"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let uri = login_uri(&[
+        ("app_redirect", "http://127.0.0.1:4321/cb"),
+        ("app_state", "s1"),
+    ]);
+    let (st, cookie) = login_with(&state, &uri).await;
+
+    let (status, headers, _) = raw(
+        &state,
+        req_with(
+            &format!("/auth/callback?code=the-code&state={st}"),
+            Some(&cookie),
+            &[HTML],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FOUND);
+    assert_cookie_cleared(&headers);
+    let (url, q) = location(&headers);
+    assert_eq!(url.port(), Some(4321));
+    assert_eq!(q["error"], "Spotify limite l’app jusqu’à 08:01 UTC");
+    assert_eq!(q["state"], "s1");
+    assert!(!q.contains_key("token"));
+    assert_eq!(rate_limited_until(&state).await, Some(NOW + 60_000));
 }

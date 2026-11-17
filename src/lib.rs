@@ -2,6 +2,7 @@
 
 pub mod account;
 pub mod auth;
+pub mod clock;
 pub mod config;
 pub mod db;
 pub mod error;
@@ -21,6 +22,7 @@ use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tracing::{Level, Span};
 
 use crate::auth::AuthUser;
+use crate::clock::Clock;
 use crate::config::Config;
 use crate::error::AppResult;
 
@@ -30,6 +32,8 @@ pub struct AppState {
     pub pool: SqlitePool,
     pub config: Arc<Config>,
     pub http: reqwest::Client,
+    /// Time source: the system clock, simulated in tests.
+    pub clock: Clock,
 }
 
 impl AppState {
@@ -38,7 +42,14 @@ impl AppState {
             pool,
             config: Arc::new(config),
             http: reqwest::Client::new(),
+            clock: Clock::system(),
         }
+    }
+
+    /// The same state on another clock (tests).
+    pub fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
     }
 }
 

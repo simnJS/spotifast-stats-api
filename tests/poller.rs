@@ -110,7 +110,6 @@ struct PollState {
     last_polled_at_ms: Option<i64>,
     next_poll_at_ms: Option<i64>,
     poll_interval_secs: Option<i64>,
-    rate_limited_until_ms: Option<i64>,
     last_poll_ok_at_ms: Option<i64>,
     last_error: Option<String>,
     last_error_at_ms: Option<i64>,
@@ -119,14 +118,23 @@ struct PollState {
 
 async fn poll_state(state: &AppState, user_id: i64) -> PollState {
     sqlx::query_as(
-        "SELECT last_polled_at_ms, next_poll_at_ms, poll_interval_secs, rate_limited_until_ms,
-                last_poll_ok_at_ms, last_error, last_error_at_ms, token_expires_at
+        "SELECT last_polled_at_ms, next_poll_at_ms, poll_interval_secs, last_poll_ok_at_ms,
+                last_error, last_error_at_ms, token_expires_at
          FROM users WHERE id = ?1",
     )
     .bind(user_id)
     .fetch_one(&state.pool)
     .await
     .unwrap()
+}
+
+/// The app-wide Spotify rate limit stored in the database: (end, start of the
+/// block), unix ms.
+async fn app_block(state: &AppState) -> (Option<i64>, Option<i64>) {
+    sqlx::query_as("SELECT rate_limited_until_ms, rate_limited_at_ms FROM app_state WHERE id = 1")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap()
 }
 
 /// The interval is `interval_s` and the next poll `interval_s` after `from_ms`,
@@ -475,75 +483,100 @@ async fn two_users_keep_separate_plays() {
 }
 
 #[tokio::test]
-async fn rate_limit_is_per_user_persisted_and_strictly_respected() {
+async fn a_429_blocks_every_user_until_its_end_even_across_a_restart() {
     let (state, server) = setup().await;
-    let bad = fresh_user(&state, "bad", "tok-bad").await;
-    let good = fresh_user(&state, "good", "tok-good").await;
+    let logs = Logs::default();
+    let _capture = logs.capture();
+    let bad = fresh_user(&state, "bad", "secret-access-bad").await;
+    let good = fresh_user(&state, "good", "secret-access-good").await;
+    for (user, refresh) in [(bad, "secret-refresh-bad"), (good, "secret-refresh-good")] {
+        sqlx::query("UPDATE users SET refresh_token = ?1 WHERE id = ?2")
+            .bind(refresh)
+            .bind(user)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+    }
     Mock::given(method("GET"))
         .and(path(RECENT))
-        .and(header("authorization", "Bearer tok-bad"))
+        .and(header("authorization", "Bearer secret-access-bad"))
         .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "27000"))
         .expect(1)
         .mount(&server)
         .await;
     mock_recent(
         &server,
-        "tok-good",
+        "secret-access-good",
         vec![item("t1", "2024-01-01T10:00:00Z", &["A"])],
     )
     .await;
 
-    assert_eq!(poll_all_users(&state, NOW).await, [bad, good]);
-    assert_eq!(play_count(&state, good).await, 1);
-
+    // `bad` comes first and gets the 429: the cycle stops, `good` is not called.
+    assert_eq!(poll_all_users(&state, NOW).await, [bad]);
+    let (until, at) = app_block(&state).await;
+    let (until, at) = (until.expect("block stored"), at.expect("start stored"));
+    assert_eq!(until - at, 27_000 * 1000, "now + Retry-After");
+    assert!((NOW..NOW + SLACK_MS).contains(&at));
     let st = poll_state(&state, bad).await;
-    let until = st.rate_limited_until_ms.expect("deadline stored");
-    let error_at = st.last_error_at_ms.expect("error time stored");
-    assert_eq!(until - error_at, 27_000 * 1000, "now + Retry-After");
-    assert!((NOW..NOW + SLACK_MS).contains(&error_at));
     assert!(st.last_error.unwrap().contains("429"));
+    assert_eq!(st.last_error_at_ms, Some(at));
+    assert_eq!(st.next_poll_at_ms, Some(until));
     assert_eq!(st.last_polled_at_ms, None, "a failed poll keeps the cursor");
     assert_eq!(st.last_poll_ok_at_ms, None);
-    assert_eq!(play_count(&state, bad).await, 0);
-    assert_eq!(
-        poll_state(&state, good).await.rate_limited_until_ms,
-        None,
-        "only that user is rate limited"
-    );
+    let st = poll_state(&state, good).await;
+    assert_eq!(st.next_poll_at_ms, None, "`good` is still due");
+    assert_eq!(st.last_error, None);
+    assert_eq!(calls(&server).await.len(), 1);
 
-    // Meanwhile the access token of `bad` expires: still no refresh before the deadline.
+    // Meanwhile the access token of `bad` expires: still no refresh before the end.
     set(&state, bad, "token_expires_at", Some(0)).await;
     // Restart: a new AppState on the same database only knows what the DB says.
     let state = AppState::new(state.pool.clone(), (*state.config).clone());
-    let before = calls(&server).await.len();
-    // `good` keeps being polled while `bad` waits.
-    assert_eq!(poll_all_users(&state, NOW + 3_000_000).await, [good]);
-    assert_eq!(poll_all_users(&state, until - 1).await, [good]);
-    let err = poll_user(&state, bad, until - 1).await.unwrap_err();
-    assert_eq!(err.kind(), "still_rate_limited");
-    let seen = calls(&server).await;
-    assert_eq!(seen.len(), before + 2, "only `good` was called");
-    assert!(
-        seen[before..]
-            .iter()
-            .all(|(p, auth)| p != "/api/token" && auth != "Bearer tok-bad")
+    assert!(poll_all_users(&state, NOW + 3_000_000).await.is_empty());
+    assert!(poll_all_users(&state, until - 1).await.is_empty());
+    for user in [bad, good] {
+        let err = poll_user(&state, user, until - 1).await.unwrap_err();
+        assert_eq!(err.kind(), "still_rate_limited");
+    }
+    assert_eq!(
+        calls(&server).await.len(),
+        1,
+        "nothing was sent to Spotify, for anyone"
     );
+    assert_eq!(play_count(&state, good).await, 0);
 
-    // From the deadline on, `bad` is polled again: token refresh, then recently-played.
-    mock_token(&server, "tok-bad-2", 1).await;
+    // From its end on, everyone is polled again: `bad` refreshes its token first.
+    mock_token(&server, "secret-access-bad-2", 1).await;
     mock_recent(
         &server,
-        "tok-bad-2",
+        "secret-access-bad-2",
         vec![item("t2", "2024-01-01T11:00:00Z", &["B"])],
     )
     .await;
-    assert!(poll_all_users(&state, until).await.contains(&bad));
+    assert_eq!(poll_all_users(&state, until).await, [bad, good]);
     assert_eq!(play_count(&state, bad).await, 1);
+    assert_eq!(play_count(&state, good).await, 1);
     let st = poll_state(&state, bad).await;
-    assert_eq!(st.rate_limited_until_ms, None);
     assert_eq!(st.last_error, None);
     assert_eq!(st.last_error_at_ms, None);
     assert!(st.last_poll_ok_at_ms.unwrap() >= until);
+
+    // The block is logged, and no token is.
+    let text = logs.text();
+    assert!(
+        text.lines().any(|l| l.contains("WARN")
+            && l.contains("HTTP 429")
+            && l.contains("no call to Spotify, for any user")),
+        "{text}"
+    );
+    for secret in [
+        "secret-access-bad",
+        "secret-access-good",
+        "secret-refresh-bad",
+        "secret-refresh-good",
+    ] {
+        assert!(!text.contains(secret), "{secret} logged: {text}");
+    }
 }
 
 #[tokio::test]
@@ -563,9 +596,10 @@ async fn rate_limit_without_retry_after_backs_off_exponentially() {
         assert_eq!(err.kind(), "rate_limited");
         assert_eq!(err.status(), Some(429));
         assert_eq!(err.retry_after(), None);
-        let st = poll_state(&state, user).await;
-        let until = st.rate_limited_until_ms.unwrap();
-        assert_eq!(until - st.last_error_at_ms.unwrap(), expected_s * 1000);
+        let (until, at) = app_block(&state).await;
+        let until = until.unwrap();
+        assert_eq!(until - at.unwrap(), expected_s * 1000);
+        assert_eq!(poll_state(&state, user).await.next_poll_at_ms, Some(until));
         // Not a millisecond early.
         assert!(poll_all_users(&state, until - 1).await.is_empty());
         t = until;
@@ -791,7 +825,7 @@ async fn revoked_refresh_token_backs_off_that_user_until_they_log_in_again() {
     assert!(st.last_error.unwrap().contains("must log in again"));
     let error_at = st.last_error_at_ms.unwrap();
     assert_eq!(st.next_poll_at_ms, Some(error_at + 6 * 3_600_000));
-    assert_eq!(st.rate_limited_until_ms, None);
+    assert_eq!(app_block(&state).await, (None, None), "not a rate limit");
     assert_eq!(st.last_polled_at_ms, Some(CURSOR), "cursor kept");
 
     // Backed off: no call for hours (expect(1) on /api/token verified on drop).
