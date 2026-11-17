@@ -161,7 +161,7 @@ how the Dockerfile is tested. Pushes to `main` publish
 | GET | `/auth/login` | none | Redirects the browser to Spotify's consent page (rate limited per IP); optional `app_redirect` and `app_state` for [desktop apps](#desktop-apps); `503` while [Spotify rate limits the app](#when-spotify-rate-limits-the-app) |
 | GET | `/auth/callback` | none | Spotify redirects here; HTML page with the token in a browser, `{"token", "user"}` JSON otherwise, or a `302` to the desktop app's `app_redirect`; `503` while [Spotify rate limits the app](#when-spotify-rate-limits-the-app) |
 | GET | `/me` | Bearer | `id`, `spotify_id`, `display_name` |
-| GET | `/me/status` | Bearer | Poller state: last successful poll, next poll, current interval, rate limit, last error, play count |
+| GET | `/me/status` | Bearer | Poller state: last successful poll, next poll, current interval and its bounds, measured pace, end of the Spotify rate limit, last error, play count (see [below](#me-status)) |
 | DELETE | `/me` | Bearer | Deletes the account, its plays and its tokens |
 | GET | `/auth/tokens` | Bearer | Lists your API tokens (`id`, `created_at`, `last_used_at`, `current`) |
 | POST | `/auth/token` | Bearer | Creates a new API token, returned once |
@@ -246,7 +246,20 @@ letting that page overflow between two polls:
 - the access token is refreshed only when it expires; if Spotify revokes it,
   the user must log in again (`/me/status` says so in `last_error`).
 
-`GET /me/status` shows where your account stands.
+<a id="me-status"></a>`GET /me/status` shows where your account stands (times are unix
+milliseconds, `null` when unknown or not applicable):
+
+| Field | Meaning |
+| --- | --- |
+| `last_poll_ok_at` | Last poll that succeeded, with or without new plays |
+| `next_poll_at` | When the poller reads Spotify next for you: the scheduled poll, or the end of the Spotify rate limit when that is later (`null`: as soon as possible) |
+| `poll_interval_secs` | Current interval between two polls, in seconds (`null` before the first poll) |
+| `poll_min_interval_secs`, `poll_max_interval_secs` | Its bounds, `POLL_INTERVAL_SECS` and `POLL_MAX_INTERVAL_SECS` |
+| `secs_per_play` | Your measured listening pace, in seconds per play, smoothed, to a tenth (`null` until measured) |
+| `rate_limited_until` | End of the app-wide block while Spotify rate limits the app (`null` otherwise) |
+| `last_error`, `last_error_at` | Last poll failure and when, cleared by the next success |
+| `last_played_at` | Newest play recorded by the poller (its cursor) |
+| `plays_count` | Plays recorded for you (poller and imports) |
 
 Why a 20 min minimum, and never less than 5 min: Spotify only counts a play
 after 30 s of listening, so 50 plays take at least 50 × 30 s = 25 min. A poll

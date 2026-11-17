@@ -9,6 +9,8 @@ use serde_json::{Value, json};
 use crate::AppState;
 use crate::auth::{self, AuthUser};
 use crate::error::{AppError, AppResult};
+use crate::spotify::rate_limit;
+use crate::spotify::round_tenth;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -18,20 +20,26 @@ pub fn router() -> Router<AppState> {
         .route("/auth/token/{id}", delete(revoke_token))
 }
 
-type StatusRow = (
-    Option<i64>,
-    Option<i64>,
-    Option<i64>,
-    Option<i64>,
-    Option<String>,
-    Option<i64>,
-    Option<i64>,
-);
+/// The poller columns of the user row that `/me/status` shows.
+#[derive(sqlx::FromRow)]
+struct StatusRow {
+    last_poll_ok_at_ms: Option<i64>,
+    next_poll_at_ms: Option<i64>,
+    poll_interval_secs: Option<i64>,
+    secs_per_play: Option<f64>,
+    last_error: Option<String>,
+    last_error_at_ms: Option<i64>,
+    last_polled_at_ms: Option<i64>,
+}
 
 /// `GET /me/status`: why is (or is not) my listening being recorded.
+///
+/// Times are unix ms. `next_poll_at` is when the poller reads Spotify next for
+/// this user: the scheduled poll, or the end of the app-wide Spotify rate limit
+/// (`rate_limited_until`) when that is later (`null`: at once).
 async fn status(State(state): State<AppState>, user: AuthUser) -> AppResult<Json<Value>> {
     let row: StatusRow = sqlx::query_as(
-        "SELECT last_poll_ok_at_ms, next_poll_at_ms, poll_interval_secs, rate_limited_until_ms, \
+        "SELECT last_poll_ok_at_ms, next_poll_at_ms, poll_interval_secs, secs_per_play, \
          last_error, last_error_at_ms, last_polled_at_ms FROM users WHERE id = ?1",
     )
     .bind(user.user_id)
@@ -42,14 +50,22 @@ async fn status(State(state): State<AppState>, user: AuthUser) -> AppResult<Json
         .bind(user.user_id)
         .fetch_one(&state.pool)
         .await?;
+    let rate_limited_until = rate_limit::blocked_until(&state.pool, state.clock.now_ms()).await?;
+    let next_poll_at = match (row.next_poll_at_ms, rate_limited_until) {
+        (Some(next), Some(until)) => Some(next.max(until)),
+        (next, until) => next.or(until),
+    };
     Ok(Json(json!({
-        "last_poll_ok_at": row.0,
-        "next_poll_at": row.1,
-        "poll_interval_secs": row.2,
-        "rate_limited_until": row.3,
-        "last_error": row.4,
-        "last_error_at": row.5,
-        "last_played_at": row.6,
+        "last_poll_ok_at": row.last_poll_ok_at_ms,
+        "next_poll_at": next_poll_at,
+        "poll_interval_secs": row.poll_interval_secs,
+        "poll_min_interval_secs": state.config.poll_interval_secs,
+        "poll_max_interval_secs": state.config.poll_max_interval_secs,
+        "secs_per_play": row.secs_per_play.map(round_tenth),
+        "rate_limited_until": rate_limited_until,
+        "last_error": row.last_error,
+        "last_error_at": row.last_error_at_ms,
+        "last_played_at": row.last_polled_at_ms,
         "plays_count": plays_count,
     })))
 }

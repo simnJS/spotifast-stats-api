@@ -11,6 +11,7 @@ use axum::routing::get;
 
 use crate::AppState;
 
+pub(crate) use poller::round_tenth;
 pub use poller::{PollError, poll_all_users, poll_user, spawn_poller};
 
 /// Routes of this module: `/auth/login` and `/auth/callback`.
