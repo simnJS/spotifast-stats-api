@@ -2,12 +2,14 @@
 //! Time is injected (`NOW`), so deadlines and schedules are deterministic up to
 //! the real duration of a poll (`SLACK_MS`) and the ±10 % jitter.
 
-use std::sync::{Arc, Mutex};
+use std::cell::RefCell;
+use std::sync::{Arc, Mutex, Once};
 
 use serde_json::{Value, json};
 use spotifast_stats_api::config::Config;
 use spotifast_stats_api::spotify::{poll_all_users, poll_user};
 use spotifast_stats_api::{AppState, db};
+use tracing_subscriber::EnvFilter;
 use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -19,8 +21,8 @@ const CURSOR: i64 = 1_799_990_000_123;
 /// wiremock): allow this much.
 const SLACK_MS: i64 = 5_000;
 /// `Config::for_tests()`: POLL_INTERVAL_SECS and POLL_MAX_INTERVAL_SECS.
-const MIN_INTERVAL_S: i64 = 120;
-const MAX_INTERVAL_S: i64 = 600;
+const MIN_INTERVAL_S: i64 = 1200;
+const MAX_INTERVAL_S: i64 = 2400;
 const RECENT: &str = "/v1/me/player/recently-played";
 
 async fn setup() -> (AppState, MockServer) {
@@ -160,6 +162,88 @@ async fn calls(server: &MockServer) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The smoothed pace stored for a user, in seconds per play.
+async fn secs_per_play(state: &AppState, user_id: i64) -> Option<f64> {
+    sqlx::query_scalar("SELECT secs_per_play FROM users WHERE id = ?1")
+        .bind(user_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap()
+}
+
+fn assert_pace(actual: Option<f64>, expected: f64) {
+    let actual = actual.expect("pace measured");
+    assert!(
+        (actual - expected).abs() < 0.01,
+        "pace {actual} s per play, expected {expected}"
+    );
+}
+
+/// Log lines of this crate written on the test's thread while a
+/// [`Logs::capture`] guard lives.
+///
+/// One global subscriber, installed once, writes every event into the buffer of
+/// the thread that emitted it when that thread is capturing (`#[tokio::test]`
+/// runs the whole test on its own thread). A per-test `set_default` subscriber
+/// would not do: tracing caches each call site's interest when a thread first
+/// reaches it, so a call site first reached by another test, without a
+/// subscriber, would stay disabled for this one too.
+#[derive(Clone, Default)]
+struct Logs(Arc<Mutex<Vec<u8>>>);
+
+thread_local! {
+    static CAPTURING: RefCell<Option<Logs>> = const { RefCell::new(None) };
+}
+
+/// Stops the capture of this thread when dropped.
+struct Capture;
+
+impl Drop for Capture {
+    fn drop(&mut self) {
+        CAPTURING.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+impl Logs {
+    fn capture(&self) -> Capture {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            tracing_subscriber::fmt()
+                .with_env_filter(EnvFilter::new("spotifast_stats_api=debug"))
+                .with_writer(|| ThreadWriter)
+                .with_ansi(false)
+                .try_init()
+                .expect("no other global subscriber in this test binary");
+        });
+        // Call sites reached before the subscriber existed are enabled now.
+        tracing::callsite::rebuild_interest_cache();
+        CAPTURING.with(|c| *c.borrow_mut() = Some(self.clone()));
+        Capture
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+/// Appends to the buffer of the current thread's capture, if any.
+struct ThreadWriter;
+
+impl std::io::Write for ThreadWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        CAPTURING.with(|c| {
+            if let Some(logs) = c.borrow().as_ref() {
+                logs.0.lock().unwrap().extend_from_slice(buf);
+            }
+        });
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Spotify's recently-played as documented: only the last 50 plays can be read,
 /// `after` keeps those strictly after the cursor, newest first.
 #[derive(Clone, Default)]
@@ -169,6 +253,24 @@ impl History {
     fn play(&self, played_at_ms: i64) {
         self.0.lock().unwrap().push(played_at_ms);
     }
+
+    /// `count` plays `gap_ms` apart, the newest at `newest_ms`.
+    fn plays(&self, newest_ms: i64, gap_ms: i64, count: i64) {
+        for i in 0..count {
+            self.play(newest_ms - i * gap_ms);
+        }
+    }
+}
+
+/// Every recently-played call is answered from a [`History`].
+async fn mock_history(server: &MockServer) -> History {
+    let history = History::default();
+    Mock::given(method("GET"))
+        .and(path(RECENT))
+        .respond_with(history.clone())
+        .mount(server)
+        .await;
+    history
 }
 
 impl Respond for History {
@@ -332,7 +434,10 @@ async fn one_recently_played_call_per_due_user_and_no_refresh_while_token_is_val
     set(&state, users[2], "token_expires_at", Some(NOW / 1000 + 90)).await;
 
     assert_eq!(poll_all_users(&state, NOW).await, users);
-    // Nobody is due again a minute later (minimum interval: 2 min ± 10 %).
+    // No play: every one of them goes to the maximum interval.
+    for &user in &users {
+        assert_scheduled(&poll_state(&state, user).await, NOW, MAX_INTERVAL_S);
+    }
     assert!(poll_all_users(&state, NOW + 60_000).await.is_empty());
     // expect(1) per user and expect(0) on /api/token are verified on drop.
 }
@@ -412,7 +517,7 @@ async fn rate_limit_is_per_user_persisted_and_strictly_respected() {
     let state = AppState::new(state.pool.clone(), (*state.config).clone());
     let before = calls(&server).await.len();
     // `good` keeps being polled while `bad` waits.
-    assert_eq!(poll_all_users(&state, NOW + 600_000).await, [good]);
+    assert_eq!(poll_all_users(&state, NOW + 3_000_000).await, [good]);
     assert_eq!(poll_all_users(&state, until - 1).await, [good]);
     let err = poll_user(&state, bad, until - 1).await.unwrap_err();
     assert_eq!(err.kind(), "still_rate_limited");
@@ -468,32 +573,88 @@ async fn rate_limit_without_retry_after_backs_off_exponentially() {
 }
 
 #[tokio::test]
-async fn interval_grows_when_idle_and_resets_on_new_plays() {
+async fn fast_listener_is_polled_at_the_minimum() {
     let (state, server) = setup().await;
     let user = fresh_user(&state, "u1", "tok").await;
-    mock_recent(&server, "tok", vec![item("t1", &iso(NOW - 60_000), &["A"])]).await;
-    assert_eq!(poll_all_users(&state, NOW).await, [user]);
+    set(&state, user, "last_polled_at_ms", Some(CURSOR)).await;
+    let history = mock_history(&server).await;
+    // 20 plays 40 s apart since the cursor: 19 × 40 s / 20 = 38 s per play,
+    // and 25 plays at that pace (950 s) take less than the minimum.
+    history.plays(NOW - 5_000, 40_000, 20);
+
+    assert_eq!(poll_user(&state, user, NOW).await.unwrap(), 20);
+    assert_pace(secs_per_play(&state, user).await, 38.0);
     assert_scheduled(&poll_state(&state, user).await, NOW, MIN_INTERVAL_S);
 
-    server.reset().await;
-    mock_recent(&server, "tok", vec![]).await;
-    for expected in [240, 480, MAX_INTERVAL_S, MAX_INTERVAL_S] {
+    // Still skipping through tracks: 25 more plays, 40 s apart.
+    let due = poll_state(&state, user).await.next_poll_at_ms.unwrap();
+    assert!(poll_all_users(&state, due - 1).await.is_empty());
+    history.plays(due - 5_000, 40_000, 25);
+    assert_eq!(poll_all_users(&state, due).await, [user]);
+    assert_eq!(play_count(&state, user).await, 45);
+    // 24 × 40 s / 25 = 38.4 s, smoothed with the previous 38 s.
+    assert_pace(secs_per_play(&state, user).await, (38.0 + 38.4) / 2.0);
+    assert_scheduled(&poll_state(&state, user).await, due, MIN_INTERVAL_S);
+}
+
+#[tokio::test]
+async fn slower_listener_is_polled_less_often_with_a_smoothed_pace() {
+    let (state, server) = setup().await;
+    let user = fresh_user(&state, "u1", "tok").await;
+    set(&state, user, "last_polled_at_ms", Some(CURSOR)).await;
+    let history = mock_history(&server).await;
+    // 10 plays 80 s apart: 9 × 80 s / 10 = 72 s per play, so 25 plays take
+    // 1800 s, between the bounds.
+    history.plays(NOW - 5_000, 80_000, 10);
+
+    assert_eq!(poll_user(&state, user, NOW).await.unwrap(), 10);
+    assert_pace(secs_per_play(&state, user).await, 72.0);
+    assert_scheduled(&poll_state(&state, user).await, NOW, 1800);
+    let due = poll_state(&state, user).await.next_poll_at_ms.unwrap();
+    assert!(poll_all_users(&state, due - 1).await.is_empty());
+
+    // Slower still: 6 plays 200 s apart, 5 × 200 s / 6 = 166.7 s per play.
+    // Smoothed: (72 + 166.7) / 2 = 119.3 s, and 25 × 119.3 s is beyond the
+    // maximum.
+    history.plays(due - 5_000, 200_000, 6);
+    assert_eq!(poll_all_users(&state, due).await, [user]);
+    let pace = (72.0 + 1000.0 / 6.0) / 2.0;
+    assert_pace(secs_per_play(&state, user).await, pace);
+    assert_scheduled(&poll_state(&state, user).await, due, MAX_INTERVAL_S);
+
+    // A single play has no time span to measure: the pace is kept.
+    let due = poll_state(&state, user).await.next_poll_at_ms.unwrap();
+    history.play(due - 5_000);
+    assert_eq!(poll_all_users(&state, due).await, [user]);
+    assert_eq!(play_count(&state, user).await, 17);
+    assert_pace(secs_per_play(&state, user).await, pace);
+    assert_scheduled(&poll_state(&state, user).await, due, MAX_INTERVAL_S);
+}
+
+#[tokio::test]
+async fn idle_listener_goes_to_the_maximum_at_once() {
+    let (state, server) = setup().await;
+    let user = fresh_user(&state, "u1", "tok").await;
+    set(&state, user, "last_polled_at_ms", Some(CURSOR)).await;
+    let history = mock_history(&server).await;
+    history.plays(NOW - 5_000, 40_000, 20);
+    assert_eq!(poll_user(&state, user, NOW).await.unwrap(), 20);
+    assert_scheduled(&poll_state(&state, user).await, NOW, MIN_INTERVAL_S);
+
+    // Nothing new: straight to the maximum, and the pace is kept.
+    for _ in 0..2 {
         let due = poll_state(&state, user).await.next_poll_at_ms.unwrap();
         assert!(poll_all_users(&state, due - 1).await.is_empty());
         assert_eq!(poll_all_users(&state, due).await, [user]);
-        assert_scheduled(&poll_state(&state, user).await, due, expected);
+        assert_scheduled(&poll_state(&state, user).await, due, MAX_INTERVAL_S);
+        assert_pace(secs_per_play(&state, user).await, 38.0);
     }
 
-    server.reset().await;
-    mock_recent(
-        &server,
-        "tok",
-        vec![item("t2", &iso(NOW + 3_600_000), &["A"])],
-    )
-    .await;
+    // Listening again, as fast as before: back to the minimum.
     let due = poll_state(&state, user).await.next_poll_at_ms.unwrap();
+    history.plays(due - 5_000, 40_000, 20);
     assert_eq!(poll_all_users(&state, due).await, [user]);
-    assert_eq!(play_count(&state, user).await, 2);
+    assert_eq!(play_count(&state, user).await, 40);
     assert_scheduled(&poll_state(&state, user).await, due, MIN_INTERVAL_S);
 }
 
@@ -526,7 +687,9 @@ async fn full_page_polls_again_at_minimum_and_cursor_skips_no_readable_play() {
     assert_eq!(poll_user(&state, user, t).await.unwrap(), 50);
     let st = poll_state(&state, user).await;
     assert_eq!(st.last_polled_at_ms, Some(at(79)), "cursor = newest play");
+    // Back to the minimum at once, whatever the pace (3 min per play here).
     assert_scheduled(&st, t, MIN_INTERVAL_S);
+    assert_pace(secs_per_play(&state, user).await, 49.0 * 180.0 / 50.0);
 
     // 30 more: all of them come back after the cursor.
     for i in 80..110 {
@@ -568,17 +731,28 @@ async fn full_page_polls_again_at_minimum_and_cursor_skips_no_readable_play() {
 async fn full_page_without_new_plays_still_polls_again_at_minimum() {
     let (state, server) = setup().await;
     let user = fresh_user(&state, "u1", "tok").await;
+    let logs = Logs::default();
+    let _guard = logs.capture();
     // The same full page every time (e.g. plays already imported).
     let page: Vec<Value> = (0..50)
         .map(|i| item(&format!("t{i}"), &iso(NOW - (i + 1) * 60_000), &["A"]))
         .collect();
     mock_recent(&server, "tok", page).await;
 
+    // The first poll's page is the backlog of the last 50 plays: no warning.
     assert_eq!(poll_user(&state, user, NOW).await.unwrap(), 50);
+    assert!(!logs.text().contains("full page"), "{}", logs.text());
+
     set(&state, user, "poll_interval_secs", Some(MAX_INTERVAL_S)).await;
     let t = NOW + 600_000;
     assert_eq!(poll_user(&state, user, t).await.unwrap(), 0);
     assert_scheduled(&poll_state(&state, user).await, t, MIN_INTERVAL_S);
+    let text = logs.text();
+    assert!(
+        text.lines()
+            .any(|l| l.contains("WARN") && l.contains("full page") && l.contains("minimum")),
+        "{text}"
+    );
 }
 
 #[tokio::test]

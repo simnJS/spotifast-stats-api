@@ -12,8 +12,9 @@ each user's Spotify plays and serves listening stats.
 | `SPOTIFY_CLIENT_ID` | required | Spotify app client id |
 | `SPOTIFY_CLIENT_SECRET` | required | Spotify app client secret |
 | `SPOTIFY_REDIRECT_URI` | required | OAuth redirect URI, must match the Spotify app |
-| `POLL_INTERVAL_SECS` | `120` | Minimum (and initial) interval between play polls, per user |
-| `POLL_MAX_INTERVAL_SECS` | `600` | Maximum poll interval for inactive users (must be >= `POLL_INTERVAL_SECS`) |
+| `POLL_INTERVAL_SECS` | `1200` | Minimum poll interval per user, in seconds: fast listeners, after a full page, while the pace is unknown. Below `300` it is refused at startup unless `POLL_ALLOW_FAST=true` (see [How plays are recorded](#how-plays-are-recorded)) |
+| `POLL_MAX_INTERVAL_SECS` | `2400` | Maximum poll interval per user, in seconds: slow and idle listeners (must be >= `POLL_INTERVAL_SECS`) |
+| `POLL_ALLOW_FAST` | `false` | Accept a `POLL_INTERVAL_SECS` below 300 (tests, debugging): it only spends quota |
 | `ALLOWED_SPOTIFY_IDS` | unset | Comma-separated Spotify user ids allowed to log in; unset = anyone Spotify lets through |
 | `TRUST_X_FORWARDED_FOR` | `false` | Take the client IP from `X-Forwarded-For`; set `true` only behind a reverse proxy |
 | `AUTH_RATE_LIMIT_PER_MIN` | `20` | Requests per minute and per IP allowed on `/auth/login` and `/auth/callback` |
@@ -224,19 +225,39 @@ verified cookie there is no trusted `app_redirect` to send it to. Without
 ### How plays are recorded
 
 Spotify only returns the 50 most recent plays and the app's quota is shared
-by every user, so the poller is frugal:
+by every user, so the poller calls Spotify as rarely as it can without ever
+letting that page overflow between two polls:
 
 - one `recently-played` call per user and per poll, only for plays newer than
-  the last one recorded;
-- the interval adapts per user between `POLL_INTERVAL_SECS` (default 2 min,
-  used while you listen) and `POLL_MAX_INTERVAL_SECS` (default 10 min, when
-  idle), with a little jitter;
+  the last one recorded (the `after` cursor);
+- each user's pace is measured on every page holding at least two plays: the
+  time between its oldest and newest play divided by the number of plays, in
+  seconds per play, smoothed by an exponential moving average (the newest page
+  counts for half) and stored in the database;
+- the next poll comes after 25 plays at that pace, so the page is about half
+  full when it is read, bounded by `POLL_INTERVAL_SECS` (default 20 min) and
+  `POLL_MAX_INTERVAL_SECS` (default 40 min), ±10 % jitter; while the pace is
+  not known yet, the minimum is used;
+- a full page (50 plays) means plays may have fallen out of it: the next poll
+  is at the minimum, at once, and a warning is logged;
+- a poll without new plays (idle user) schedules the next one at the maximum;
 - when Spotify answers 429, that user is not called again before the
   `Retry-After` delay, even across restarts (it is stored in the database);
 - the access token is refreshed only when it expires; if Spotify revokes it,
   the user must log in again (`/me/status` says so in `last_error`).
 
 `GET /me/status` shows where your account stands.
+
+Why a 20 min minimum, and never less than 5 min: Spotify only counts a play
+after 30 s of listening, so 50 plays take at least 50 × 30 s = 25 min. A poll
+every 20 min (22 at most with the jitter) cannot miss a play, even for someone
+skipping tracks every 30 s. Every 5 min the page would be at most a fifth full:
+a shorter minimum only spends the shared quota, so a `POLL_INTERVAL_SECS` below
+300 is refused at startup unless `POLL_ALLOW_FAST=true`. The maximum (40 min)
+is used for paces above 96 s per play, where 25 plays take more than 40 min, and
+after an idle poll; then only someone skipping a track every 30 to 48 s for 40
+minutes straight could fill the page before the next poll, and the full-page
+warning would show it.
 
 ### Query parameters
 
