@@ -37,19 +37,23 @@ impl AppError {
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
+
+    /// The message shown to clients: internal details are not leaked.
+    pub fn public_message(&self) -> String {
+        match self {
+            Self::Internal(_) => "internal server error".to_string(),
+            other => other.to_string(),
+        }
+    }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status();
-        let message = match &self {
-            // Do not leak internal details to clients.
-            Self::Internal(m) => {
-                tracing::error!(error = %m, "internal error");
-                "internal server error".to_string()
-            }
-            other => other.to_string(),
-        };
+        if let Self::Internal(m) = &self {
+            tracing::error!(error = %m, "internal error");
+        }
+        let message = self.public_message();
         let mut resp = (status, Json(json!({ "error": message }))).into_response();
         if let Self::TooManyRequests(secs) = self {
             resp.headers_mut().insert(

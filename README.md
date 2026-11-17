@@ -157,8 +157,8 @@ how the Dockerfile is tested. Pushes to `main` publish
 | Method | Path | Auth | Description |
 | --- | --- | --- | --- |
 | GET | `/health` | none | `{"status":"ok"}` when the database answers, 503 otherwise |
-| GET | `/auth/login` | none | Redirects the browser to Spotify's consent page (rate limited per IP) |
-| GET | `/auth/callback` | none | Spotify redirects here; HTML page with the token in a browser, `{"token", "user"}` JSON otherwise |
+| GET | `/auth/login` | none | Redirects the browser to Spotify's consent page (rate limited per IP); optional `app_redirect` and `app_state` for [desktop apps](#desktop-apps) |
+| GET | `/auth/callback` | none | Spotify redirects here; HTML page with the token in a browser, `{"token", "user"}` JSON otherwise, or a `302` to the desktop app's `app_redirect` |
 | GET | `/me` | Bearer | `id`, `spotify_id`, `display_name` |
 | GET | `/me/status` | Bearer | Poller state: last successful poll, next poll, current interval, rate limit, last error, play count |
 | DELETE | `/me` | Bearer | Deletes the account, its plays and its tokens |
@@ -192,6 +192,34 @@ in becomes a separate user (restrict who may log in with
 Users who logged in before `/now-playing` existed must log in again once to
 use it (it needs the `user-read-currently-playing` scope); play tracking keeps
 working without that.
+
+### Desktop apps
+
+A desktop app (such as Spotifast) can receive the token itself instead of the
+user copying it from the callback page, with the loopback redirect of
+[RFC 8252](https://www.rfc-editor.org/rfc/rfc8252#section-7.3):
+
+1. Listen on a loopback port, for example `http://127.0.0.1:53682/callback`.
+2. Open the system browser on
+   `https://<your domain>/auth/login?app_redirect=<URL-encoded loopback URL>&app_state=<random value>`.
+3. After the Spotify consent, `/auth/callback` answers `302` to
+   `<app_redirect>?token=<token>&state=<app_state>` instead of showing the
+   token page (with `&` instead of `?` when `app_redirect` already has a
+   query; values are URL-encoded). If the login fails after the state check
+   (consent refused, Spotify error, account not allowed...), it redirects to
+   `<app_redirect>?error=<message>&state=<app_state>` instead.
+4. Check that `state` is the value you sent, then keep `token`.
+
+| Parameter | Rule |
+| --- | --- |
+| `app_redirect` | Optional. An `http` URL whose host is `127.0.0.1`, `[::1]` or `localhost`, with an explicit port (not the default `80`), any path and query, no user info and no fragment, at most 512 characters. Anything else gets `400 {"error":"app_redirect must be a loopback http URL"}`, so a token can only be handed to a program on the user's own machine. |
+| `app_state` | Optional. Up to 128 characters of `A-Z a-z 0-9 _ -`, otherwise `400`. Sent back unchanged as `state` (omitted when not given). Only used along with `app_redirect`. |
+
+An empty value counts as absent. Both are kept in the signed state cookie, so
+they cannot be changed between login and callback. A missing, invalid or
+expired `state` at the callback still gets the plain JSON error: without a
+verified cookie there is no trusted `app_redirect` to send it to. Without
+`app_redirect`, the login works as described above.
 
 ### How plays are recorded
 

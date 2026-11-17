@@ -3,6 +3,12 @@
 //! The anti-CSRF `state` is a random nonce stored in a short-lived, HttpOnly
 //! cookie signed with HMAC-SHA256 (keyed with the Spotify client secret), so the
 //! callback only accepts a state issued to the same browser.
+//!
+//! Desktop apps can use the RFC 8252 loopback pattern: `/auth/login` accepts an
+//! `app_redirect` (a loopback `http` URL with an explicit port) and an opaque
+//! `app_state`. Both travel inside the signed cookie, and the callback then
+//! redirects to `app_redirect` with `token` (or `error`) and `state` instead of
+//! rendering the token page.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -10,6 +16,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use axum::Json;
+use axum::extract::rejection::QueryRejection;
 use axum::extract::{ConnectInfo, Query, State};
 use axum::http::header::{ACCEPT, CACHE_CONTROL, CONTENT_TYPE, COOKIE, LOCATION, SET_COOKIE};
 use axum::http::request::Parts;
@@ -28,6 +35,9 @@ use crate::error::{AppError, AppResult};
 
 const COOKIE_NAME: &str = "spotify_oauth_state";
 const STATE_TTL_SECS: i64 = 600;
+/// Longest accepted `app_redirect` once normalized (it is hex-encoded in the cookie).
+const APP_REDIRECT_MAX_LEN: usize = 512;
+const APP_STATE_MAX_LEN: usize = 128;
 
 fn hmac_sha256(key: &[u8], msg: &[u8]) -> Vec<u8> {
     const BLOCK: usize = 64;
@@ -46,10 +56,11 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> Vec<u8> {
     outer.finalize().to_vec()
 }
 
-fn sign(state: &AppState, nonce: &str, expires: i64) -> String {
+/// HMAC of the cookie's message (everything before its last `.`).
+fn sign(state: &AppState, msg: &str) -> String {
     hex::encode(hmac_sha256(
         state.config.spotify_client_secret.as_bytes(),
-        format!("{nonce}.{expires}").as_bytes(),
+        msg.as_bytes(),
     ))
 }
 
@@ -73,16 +84,125 @@ fn header(v: &str) -> AppResult<HeaderValue> {
     HeaderValue::from_str(v).map_err(|e| AppError::Internal(format!("invalid header: {e}")))
 }
 
-/// `GET /auth/login`: redirect to Spotify's authorize page.
-pub async fn login(State(state): State<AppState>, parts: Parts) -> AppResult<Response> {
+// ---- desktop app return (RFC 8252 loopback redirect) -----------------------
+
+/// Where a desktop app wants the login result, carried in the signed cookie.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppTarget {
+    /// A loopback URL, as validated and normalized by [`parse_app_redirect`].
+    redirect: String,
+    /// Echoed back as `state`; `None` when the app sent none.
+    state: Option<String>,
+}
+
+/// Accept only `http://{127.0.0.1|[::1]|localhost}:<port>/<path>[?query]`,
+/// without userinfo or fragment: any other target could hand the token to a
+/// third party.
+fn parse_app_redirect(raw: &str) -> AppResult<reqwest::Url> {
+    let bad = || AppError::BadRequest("app_redirect must be a loopback http URL".into());
+    let url = reqwest::Url::parse(raw).map_err(|_| bad())?;
+    // The parser normalizes the host (lowercase, canonical IPv4 and IPv6) and
+    // drops a default port, so `:80` counts as no port; loopback listeners use
+    // an ephemeral one anyway.
+    let loopback = matches!(url.host_str(), Some("127.0.0.1" | "[::1]" | "localhost"));
+    let ok = url.scheme() == "http"
+        && loopback
+        && url.port().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.fragment().is_none()
+        && url.as_str().len() <= APP_REDIRECT_MAX_LEN;
+    if ok { Ok(url) } else { Err(bad()) }
+}
+
+fn check_app_state(s: &str) -> AppResult<()> {
+    let ok = s.len() <= APP_STATE_MAX_LEN
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if ok {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(format!(
+            "app_state must be at most {APP_STATE_MAX_LEN} characters of [A-Za-z0-9_-]"
+        )))
+    }
+}
+
+/// Validate the optional desktop app parameters (empty values count as absent).
+/// `app_state` is only kept along with an `app_redirect`.
+fn app_target(params: LoginParams) -> AppResult<Option<AppTarget>> {
+    let redirect = params
+        .app_redirect
+        .as_deref()
+        .filter(|r| !r.is_empty())
+        .map(parse_app_redirect)
+        .transpose()?;
+    let state = params.app_state.filter(|s| !s.is_empty());
+    if let Some(s) = &state {
+        check_app_state(s)?;
+    }
+    Ok(redirect.map(|url| AppTarget {
+        redirect: url.as_str().to_owned(),
+        state,
+    }))
+}
+
+/// The cookie's signed message: `nonce.expires` (the original format, still
+/// used for browser logins), or `nonce.expires.<hex app_redirect>.<app_state>`.
+fn state_message(nonce: &str, expires: i64, app: Option<&AppTarget>) -> String {
+    match app {
+        None => format!("{nonce}.{expires}"),
+        Some(t) => format!(
+            "{nonce}.{expires}.{}.{}",
+            hex::encode(&t.redirect),
+            t.state.as_deref().unwrap_or("")
+        ),
+    }
+}
+
+/// `302` to the desktop app's loopback URL, with `key=value` then `state`
+/// appended to its query.
+fn redirect_to_app(app: &AppTarget, key: &str, value: &str) -> AppResult<Response> {
+    // Checked again even though the cookie is signed: this is where the token goes.
+    let mut url = parse_app_redirect(&app.redirect)?;
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair(key, value);
+        if let Some(s) = &app.state {
+            query.append_pair("state", s);
+        }
+    }
+    let mut resp = StatusCode::FOUND.into_response();
+    resp.headers_mut().insert(LOCATION, header(url.as_str())?);
+    Ok(resp)
+}
+
+// ---- login ------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct LoginParams {
+    app_redirect: Option<String>,
+    app_state: Option<String>,
+}
+
+/// `GET /auth/login[?app_redirect&app_state]`: redirect to Spotify's authorize page.
+pub async fn login(
+    State(state): State<AppState>,
+    parts: Parts,
+    query: Result<Query<LoginParams>, QueryRejection>,
+) -> AppResult<Response> {
     check_rate_limit(&state, &parts)?;
+    let Query(params) = query.map_err(|e| AppError::BadRequest(e.body_text()))?;
+    let app = app_target(params)?;
+
     let mut bytes = [0u8; 16];
     rand::rng().fill_bytes(&mut bytes);
     let nonce = hex::encode(bytes);
     let expires = now_secs() + STATE_TTL_SECS;
+    let msg = state_message(&nonce, expires, app.as_ref());
     let cookie = format!(
-        "{COOKIE_NAME}={nonce}.{expires}.{}; Max-Age={STATE_TTL_SECS}{}",
-        sign(&state, &nonce, expires),
+        "{COOKIE_NAME}={msg}.{}; Max-Age={STATE_TTL_SECS}{}",
+        sign(&state, &msg),
         cookie_attrs(&state)
     );
 
@@ -105,6 +225,8 @@ pub async fn login(State(state): State<AppState>, parts: Parts) -> AppResult<Res
     Ok(resp)
 }
 
+// ---- callback -----------------------------------------------------------------
+
 #[derive(Debug, Deserialize)]
 pub struct CallbackParams {
     code: Option<String>,
@@ -112,30 +234,37 @@ pub struct CallbackParams {
     error: Option<String>,
 }
 
+/// What a verified state cookie carries.
+struct VerifiedState {
+    app: Option<AppTarget>,
+}
+
 /// Verify the `state` query parameter against the signed cookie.
-fn verify_state(app: &AppState, headers: &HeaderMap, state_param: &str) -> bool {
+fn verify_state(app: &AppState, headers: &HeaderMap, state_param: &str) -> Option<VerifiedState> {
     let prefix = format!("{COOKIE_NAME}=");
-    let cookie_value = headers
+    let value = headers
         .get_all(COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
-        .find_map(|p| p.trim().strip_prefix(prefix.as_str()));
-    let Some(value) = cookie_value else {
-        return false;
+        .find_map(|p| p.trim().strip_prefix(prefix.as_str()))?;
+    let (msg, sig) = value.rsplit_once('.')?;
+    if !constant_time_eq(sign(app, msg).as_bytes(), sig.as_bytes()) {
+        return None;
+    }
+    let mut fields = msg.split('.');
+    let nonce = fields.next()?;
+    let expires: i64 = fields.next()?.parse().ok()?;
+    let target = match (fields.next(), fields.next(), fields.next()) {
+        (None, None, None) => None,
+        (Some(redirect_hex), Some(app_state), None) => Some(AppTarget {
+            redirect: String::from_utf8(hex::decode(redirect_hex).ok()?).ok()?,
+            state: (!app_state.is_empty()).then(|| app_state.to_owned()),
+        }),
+        _ => return None,
     };
-    let mut parts = value.split('.');
-    let (Some(nonce), Some(expires), Some(sig), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return false;
-    };
-    let Ok(expires_n) = expires.parse::<i64>() else {
-        return false;
-    };
-    constant_time_eq(sign(app, nonce, expires_n).as_bytes(), sig.as_bytes())
-        && expires_n >= now_secs()
-        && constant_time_eq(nonce.as_bytes(), state_param.as_bytes())
+    (expires >= now_secs() && constant_time_eq(nonce.as_bytes(), state_param.as_bytes()))
+        .then_some(VerifiedState { app: target })
 }
 
 /// Log a callback failure once, at warn, with its stage and cause.
@@ -144,9 +273,10 @@ fn log_failure(stage: &str, cause: &dyn std::fmt::Display) {
     tracing::warn!(stage, %cause, "spotify login failed");
 }
 
-fn fail(stage: &str, cause: &dyn std::fmt::Display, err: AppError) -> Response {
+/// Log a callback failure and return the error to show for it.
+fn fail(stage: &str, cause: &dyn std::fmt::Display, err: AppError) -> AppError {
     log_failure(stage, cause);
-    err.into_response()
+    err
 }
 
 fn html_escape(s: &str) -> String {
@@ -190,32 +320,95 @@ code,pre{{background:#eee;padding:.2rem .4rem;border-radius:4px;word-break:break
     )
 }
 
-/// `GET /auth/callback?code&state`: finish the login and return an API token.
-// Failures are already-logged, ready-made responses; boxing them would only add noise.
-#[allow(clippy::result_large_err)]
+/// A finished login.
+struct LoggedIn {
+    token: String,
+    user_id: i64,
+    spotify_id: String,
+    display_name: String,
+}
+
+/// The token page (HTML for a browser, JSON otherwise).
+fn token_response(headers: &HeaderMap, login: &LoggedIn) -> Response {
+    if wants_html(headers) {
+        (
+            [(CONTENT_TYPE, "text/html; charset=utf-8")],
+            token_page(&login.display_name, &login.token),
+        )
+            .into_response()
+    } else {
+        Json(json!({
+            "token": login.token,
+            "user": {
+                "id": login.user_id,
+                "spotify_id": login.spotify_id,
+                "display_name": login.display_name,
+            },
+        }))
+        .into_response()
+    }
+}
+
+/// `GET /auth/callback?code&state`: finish the login and return an API token,
+/// or hand it (or the error) to the desktop app's `app_redirect`.
 pub async fn callback(
     State(state): State<AppState>,
     parts: Parts,
     Query(params): Query<CallbackParams>,
-) -> Result<Response, Response> {
-    check_rate_limit(&state, &parts).map_err(IntoResponse::into_response)?;
+) -> Response {
+    if let Err(e) = check_rate_limit(&state, &parts) {
+        return e.into_response();
+    }
     let headers = &parts.headers;
 
     let Some(state_param) = params.state.as_deref() else {
-        return Err(fail(
+        return fail(
             "state check",
             &"missing state parameter",
             AppError::BadRequest("missing state".into()),
-        ));
+        )
+        .into_response();
     };
-    if !verify_state(&state, headers, state_param) {
-        return Err(fail(
+    // Without a verified cookie there is no trusted `app_redirect` either, so
+    // these failures always get the plain error response.
+    let Some(verified) = verify_state(&state, headers, state_param) else {
+        return fail(
             "state check",
             &"state does not match the cookie, or expired",
             AppError::BadRequest("invalid or expired state".into()),
-        ));
-    }
-    if let Some(err) = params.error {
+        )
+        .into_response();
+    };
+
+    let outcome = finish_login(&state, params.error, params.code).await;
+    let resp = match (verified.app, outcome) {
+        (Some(app), Ok(login)) => redirect_to_app(&app, "token", &login.token),
+        (Some(app), Err(e)) => redirect_to_app(&app, "error", &e.public_message()),
+        (None, Ok(login)) => Ok(token_response(headers, &login)),
+        (None, Err(e)) => return e.into_response(),
+    };
+    resp.and_then(|r| no_store_and_clear_cookie(&state, r))
+        .unwrap_or_else(IntoResponse::into_response)
+}
+
+/// The responses that end a login carry the token: never cache them, and
+/// retire the state cookie.
+fn no_store_and_clear_cookie(state: &AppState, mut resp: Response) -> AppResult<Response> {
+    let clear = format!("{COOKIE_NAME}=; Max-Age=0{}", cookie_attrs(state));
+    resp.headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    resp.headers_mut().insert(SET_COOKIE, header(&clear)?);
+    Ok(resp)
+}
+
+/// Exchange the code, save the user and issue an API token. Failures are
+/// logged here and come back as the error to show.
+async fn finish_login(
+    state: &AppState,
+    error: Option<String>,
+    code: Option<String>,
+) -> AppResult<LoggedIn> {
+    if let Some(err) = error {
         // `error` is chosen by the caller: keep it short in the logs.
         let short: String = err.chars().take(64).collect();
         return Err(fail(
@@ -224,7 +417,7 @@ pub async fn callback(
             AppError::BadRequest(format!("Spotify denied access: {short}")),
         ));
     }
-    let Some(code) = params.code.filter(|c| !c.is_empty()) else {
+    let Some(code) = code.filter(|c| !c.is_empty()) else {
         return Err(fail(
             "state check",
             &"missing code parameter",
@@ -232,7 +425,7 @@ pub async fn callback(
         ));
     };
 
-    let tokens = client::exchange_code(&state, &code).await.map_err(|e| {
+    let tokens = client::exchange_code(state, &code).await.map_err(|e| {
         fail(
             "token exchange",
             &e,
@@ -249,7 +442,7 @@ pub async fn callback(
             AppError::BadGateway("Spotify returned no refresh token".into()),
         ));
     };
-    let profile = client::get_profile(&state, &tokens.access_token)
+    let profile = client::get_profile(state, &tokens.access_token)
         .await
         .map_err(|e| {
             fail(
@@ -313,28 +506,12 @@ pub async fn callback(
     .map_err(db_fail)?;
 
     let token = issue_token(&state.pool, user_id).await.map_err(db_fail)?;
-
-    let clear = format!("{COOKIE_NAME}=; Max-Age=0{}", cookie_attrs(&state));
-    let mut resp = if wants_html(headers) {
-        (
-            [(CONTENT_TYPE, "text/html; charset=utf-8")],
-            token_page(&display_name, &token),
-        )
-            .into_response()
-    } else {
-        Json(json!({
-            "token": token,
-            "user": { "id": user_id, "spotify_id": profile.id, "display_name": display_name },
-        }))
-        .into_response()
-    };
-    resp.headers_mut()
-        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    resp.headers_mut().insert(
-        SET_COOKIE,
-        header(&clear).map_err(IntoResponse::into_response)?,
-    );
-    Ok(resp)
+    Ok(LoggedIn {
+        token,
+        user_id,
+        spotify_id: profile.id,
+        display_name,
+    })
 }
 
 // ---- per-IP rate limit ----------------------------------------------------
@@ -412,6 +589,102 @@ mod tests {
         assert_eq!(
             hex::encode(mac),
             "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
+    fn app_redirect_accepts_loopback_http_with_a_port() {
+        for (raw, normalized) in [
+            (
+                "http://127.0.0.1:4321/callback",
+                "http://127.0.0.1:4321/callback",
+            ),
+            ("http://[::1]:4321/cb", "http://[::1]:4321/cb"),
+            ("http://[0:0:0:0:0:0:0:1]:4321/cb", "http://[::1]:4321/cb"),
+            (
+                "http://localhost:4321/cb?x=1",
+                "http://localhost:4321/cb?x=1",
+            ),
+            ("http://LocalHost:4321", "http://localhost:4321/"),
+        ] {
+            let url = parse_app_redirect(raw).unwrap_or_else(|e| panic!("{raw}: {e}"));
+            assert_eq!(url.as_str(), normalized);
+        }
+    }
+
+    #[test]
+    fn app_redirect_refuses_everything_else() {
+        let long = format!("http://127.0.0.1:4321/{}", "a".repeat(APP_REDIRECT_MAX_LEN));
+        for raw in [
+            "https://127.0.0.1:4321/cb",
+            "ftp://127.0.0.1:4321/cb",
+            "http://127.0.0.1/cb",
+            // A default port is indistinguishable from none once parsed.
+            "http://127.0.0.1:80/cb",
+            "http://127.0.0.2:4321/cb",
+            "http://example.com:4321/cb",
+            "http://localhost.example.com:4321/cb",
+            "http://127.0.0.1:4321@example.com/cb",
+            "http://user@127.0.0.1:4321/cb",
+            "http://user:pw@127.0.0.1:4321/cb",
+            "http://127.0.0.1:4321/cb#frag",
+            "http://127.0.0.1:4321/cb#",
+            "javascript:alert(1)",
+            "/auth/callback",
+            "",
+            long.as_str(),
+        ] {
+            let err = parse_app_redirect(raw).expect_err(raw);
+            assert_eq!(err.to_string(), "app_redirect must be a loopback http URL");
+        }
+    }
+
+    #[test]
+    fn app_state_is_short_and_url_safe() {
+        assert!(check_app_state("abc_DEF-0123").is_ok());
+        assert!(check_app_state(&"a".repeat(APP_STATE_MAX_LEN)).is_ok());
+        for bad in [
+            "a".repeat(APP_STATE_MAX_LEN + 1),
+            "with space".into(),
+            "dot.dot".into(),
+            "semi;colon".into(),
+            "é".into(),
+        ] {
+            assert!(check_app_state(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn app_redirect_appends_to_the_existing_query() {
+        let app = AppTarget {
+            redirect: "http://127.0.0.1:4321/cb?x=1".into(),
+            state: Some("s-1".into()),
+        };
+        let resp = redirect_to_app(&app, "error", "a b&c").unwrap();
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        assert_eq!(
+            resp.headers()[LOCATION],
+            "http://127.0.0.1:4321/cb?x=1&error=a+b%26c&state=s-1"
+        );
+
+        let app = AppTarget {
+            redirect: "http://[::1]:4321/cb".into(),
+            state: None,
+        };
+        let resp = redirect_to_app(&app, "token", "t").unwrap();
+        assert_eq!(resp.headers()[LOCATION], "http://[::1]:4321/cb?token=t");
+    }
+
+    #[test]
+    fn cookie_message_keeps_the_original_format_without_an_app() {
+        assert_eq!(state_message("ab", 7, None), "ab.7");
+        let app = AppTarget {
+            redirect: "http://localhost:1/".into(),
+            state: None,
+        };
+        assert_eq!(
+            state_message("ab", 7, Some(&app)),
+            format!("ab.7.{}.", hex::encode("http://localhost:1/"))
         );
     }
 }

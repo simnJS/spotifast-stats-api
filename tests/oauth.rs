@@ -51,7 +51,19 @@ fn get_req(uri: &str, cookie: Option<&str>, bearer: Option<&str>) -> Request<Bod
 
 /// Hit /auth/login; returns (state parameter, cookie to send back).
 async fn login(state: &AppState) -> (String, String) {
-    let (status, headers, _) = call(state, get_req("/auth/login", None, None)).await;
+    login_with(state, "/auth/login").await
+}
+
+/// `/auth/login` with these query parameters, URL-encoded.
+fn login_uri(params: &[(&str, &str)]) -> String {
+    let mut url = reqwest::Url::parse("http://x/auth/login").unwrap();
+    url.query_pairs_mut().extend_pairs(params);
+    format!("/auth/login?{}", url.query().unwrap())
+}
+
+/// Hit this login URI; returns (state parameter, cookie to send back).
+async fn login_with(state: &AppState, uri: &str) -> (String, String) {
+    let (status, headers, _) = call(state, get_req(uri, None, None)).await;
     assert!(status == StatusCode::FOUND || status == StatusCode::SEE_OTHER);
     let location = headers["location"].to_str().unwrap();
     let url = reqwest::Url::parse(location).unwrap();
@@ -222,14 +234,19 @@ async fn callback_raw(
     headers: &[(&str, &str)],
 ) -> (StatusCode, axum::http::HeaderMap, String) {
     let (st, cookie) = login(state).await;
-    let resp = app(state.clone())
-        .oneshot(req_with(
+    raw(
+        state,
+        req_with(
             &format!("/auth/callback?code=the-code&state={st}"),
             Some(&cookie),
             headers,
-        ))
-        .await
-        .unwrap();
+        ),
+    )
+    .await
+}
+
+async fn raw(state: &AppState, req: Request<Body>) -> (StatusCode, axum::http::HeaderMap, String) {
+    let resp = app(state.clone()).oneshot(req).await.unwrap();
     let status = resp.status();
     let h = resp.headers().clone();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -416,6 +433,219 @@ async fn callback_answers_html_or_json_by_accept_header() {
             .starts_with("application/json")
     );
     assert_eq!(headers["cache-control"], "no-store");
+    assert!(headers.get("location").is_none());
     let v: Value = serde_json::from_str(&json_body).unwrap();
     assert!(v["token"].is_string());
+}
+
+// ---- desktop apps: app_redirect / app_state (RFC 8252 loopback) ----------
+
+const APP_REDIRECT_ERROR: &str = "app_redirect must be a loopback http URL";
+
+fn location(headers: &axum::http::HeaderMap) -> (reqwest::Url, HashMap<String, String>) {
+    let url = reqwest::Url::parse(headers["location"].to_str().unwrap()).unwrap();
+    let q = url.query_pairs().into_owned().collect();
+    (url, q)
+}
+
+fn assert_cookie_cleared(headers: &axum::http::HeaderMap) {
+    let set = headers["set-cookie"].to_str().unwrap();
+    assert!(set.starts_with("spotify_oauth_state=; Max-Age=0"), "{set}");
+}
+
+#[tokio::test]
+async fn plain_login_keeps_the_original_cookie_format() {
+    let (state, _server) = setup().await;
+    let (_, cookie) = login(&state).await;
+    // nonce.expires.signature
+    assert_eq!(cookie.split('.').count(), 3, "{cookie}");
+}
+
+#[tokio::test]
+async fn login_accepts_a_loopback_app_redirect() {
+    let (state, _server) = setup().await;
+    for redirect in [
+        "http://127.0.0.1:4321/callback",
+        "http://[::1]:4321/cb",
+        "http://localhost:4321/cb?x=1",
+    ] {
+        // `login_with` checks the redirect to Spotify's authorize page.
+        let uri = login_uri(&[("app_redirect", redirect), ("app_state", "abc_DEF-123")]);
+        let (st, cookie) = login_with(&state, &uri).await;
+        assert_eq!(st.len(), 32);
+        // nonce.expires.redirect.app_state.signature
+        assert_eq!(cookie.split('.').count(), 5, "{cookie}");
+        assert!(cookie.contains(".abc_DEF-123."), "{cookie}");
+    }
+}
+
+#[tokio::test]
+async fn login_refuses_a_non_loopback_app_redirect_or_a_bad_app_state() {
+    let (state, _server) = setup_with(|c| c.auth_rate_limit_per_min = 1000).await;
+    for redirect in [
+        "http://example.com:4321/cb",
+        "http://127.0.0.2:4321/cb",
+        "https://127.0.0.1:4321/cb",
+        "https://localhost:4321/cb",
+        "http://127.0.0.1/cb",
+        "http://localhost/cb",
+        "http://127.0.0.1:4321@example.com/cb",
+        "http://user:pw@127.0.0.1:4321/cb",
+        "http://127.0.0.1:4321/cb#frag",
+        "not a url",
+    ] {
+        let uri = login_uri(&[("app_redirect", redirect), ("app_state", "s")]);
+        let (status, headers, body) = call(&state, get_req(&uri, None, None)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{redirect}");
+        assert_eq!(body, json!({ "error": APP_REDIRECT_ERROR }), "{redirect}");
+        assert!(headers.get("set-cookie").is_none());
+        assert!(headers.get("location").is_none());
+    }
+    for app_state in ["a".repeat(129), "with space".into(), "dot.dot".into()] {
+        let uri = login_uri(&[
+            ("app_redirect", "http://127.0.0.1:4321/cb"),
+            ("app_state", app_state.as_str()),
+        ]);
+        let (status, _, body) = call(&state, get_req(&uri, None, None)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{app_state}");
+        assert!(
+            body["error"].as_str().unwrap().starts_with("app_state"),
+            "{body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn callback_redirects_the_token_to_the_app() {
+    let (state, server) = setup().await;
+    mock_oauth(&server, "sp-user", json!("Spo"), "refresh-1").await;
+    let uri = login_uri(&[
+        ("app_redirect", "http://127.0.0.1:4321/done?x=1"),
+        ("app_state", "xyz-1"),
+    ]);
+    let (st, cookie) = login_with(&state, &uri).await;
+
+    // Even a browser asking for HTML gets the redirect, not the token page.
+    let (status, headers, body) = raw(
+        &state,
+        req_with(
+            &format!("/auth/callback?code=the-code&state={st}"),
+            Some(&cookie),
+            &[("accept", "text/html")],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FOUND);
+    assert!(!body.contains("only once"));
+    assert_eq!(headers["cache-control"], "no-store");
+    assert_cookie_cleared(&headers);
+
+    let loc = headers["location"].to_str().unwrap();
+    assert!(
+        loc.starts_with("http://127.0.0.1:4321/done?x=1&token="),
+        "{loc}"
+    );
+    assert!(loc.ends_with("&state=xyz-1"), "{loc}");
+    let (url, q) = location(&headers);
+    assert_eq!(url.path(), "/done");
+    assert_eq!(q["x"], "1");
+    assert_eq!(q["state"], "xyz-1");
+    assert!(!q.contains_key("error"));
+
+    let (status, _, me) = call(&state, get_req("/me", None, Some(q["token"].as_str()))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(me["spotify_id"], "sp-user");
+}
+
+#[tokio::test]
+async fn callback_redirects_errors_to_the_app() {
+    let (state, server) = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/api/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error":"invalid_grant"})))
+        .mount(&server)
+        .await;
+
+    // The user refused on Spotify's consent page.
+    let uri = login_uri(&[
+        ("app_redirect", "http://[::1]:4321/cb"),
+        ("app_state", "s1"),
+    ]);
+    let (st, cookie) = login_with(&state, &uri).await;
+    let (status, headers, _) = raw(
+        &state,
+        get_req(
+            &format!("/auth/callback?error=access_denied&state={st}"),
+            Some(&cookie),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FOUND);
+    assert_cookie_cleared(&headers);
+    let (url, q) = location(&headers);
+    assert_eq!(url.host_str(), Some("[::1]"));
+    assert_eq!(url.port(), Some(4321));
+    assert_eq!(url.path(), "/cb");
+    assert_eq!(q["error"], "Spotify denied access: access_denied");
+    assert_eq!(q["state"], "s1");
+    assert!(!q.contains_key("token"));
+
+    // A bad code: Spotify refuses the exchange. No app_state, so no `state`.
+    let uri = login_uri(&[("app_redirect", "http://localhost:4321/cb")]);
+    let (st, cookie) = login_with(&state, &uri).await;
+    let (status, headers, _) = raw(
+        &state,
+        get_req(
+            &format!("/auth/callback?code=bad&state={st}"),
+            Some(&cookie),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FOUND);
+    let (url, q) = location(&headers);
+    assert_eq!(url.host_str(), Some("localhost"));
+    assert!(q["error"].contains("token exchange failed"), "{q:?}");
+    assert!(!q.contains_key("state"));
+    assert!(!q.contains_key("token"));
+    assert_eq!(user_count(&state).await, 0);
+}
+
+#[tokio::test]
+async fn app_redirect_in_the_cookie_cannot_be_tampered_with() {
+    let (state, server) = setup().await;
+    mock_oauth(&server, "sp-user", json!("Spo"), "refresh-1").await;
+    let uri = login_uri(&[
+        ("app_redirect", "http://127.0.0.1:4321/cb"),
+        ("app_state", "s1"),
+    ]);
+    let (st, cookie) = login_with(&state, &uri).await;
+    let f: Vec<&str> = cookie.split('.').collect();
+    let callback = format!("/auth/callback?code=the-code&state={st}");
+
+    let other = hex::encode("http://127.0.0.1:9999/cb");
+    let swapped = format!("{}.{}.{other}.{}.{}", f[0], f[1], f[3], f[4]);
+    let restated = format!("{}.{}.{}.evil.{}", f[0], f[1], f[2], f[4]);
+    // Dropping the app fields does not turn it into a valid plain cookie either.
+    let downgraded = format!("{}.{}.{}", f[0], f[1], f[4]);
+    for forged in [swapped.as_str(), restated.as_str(), downgraded.as_str()] {
+        let (status, headers, _) = call(&state, get_req(&callback, Some(forged), None)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{forged}");
+        assert!(headers.get("location").is_none());
+    }
+
+    // A wrong state with a genuine cookie is a plain error, not a redirect.
+    let (status, headers, _) = call(
+        &state,
+        get_req(
+            "/auth/callback?code=the-code&state=nope",
+            Some(&cookie),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(headers.get("location").is_none());
+    assert_eq!(user_count(&state).await, 0);
 }
