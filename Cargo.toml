@@ -31,9 +31,9 @@ rand = "0.9"
 tower-http = { version = "0.6", features = ["trace"] }
 zip = { version = "9.6.0", default-features = false, features = ["deflate"] }
 chrono-tz = "0.10.4"
+http-body-util = "0.1"
+tempfile = "3"
 
 [dev-dependencies]
 wiremock = "0.6"
 tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
-tempfile = "3"

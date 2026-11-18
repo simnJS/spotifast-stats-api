@@ -622,3 +622,49 @@ async fn large_zip_imports_quickly() {
     assert_eq!(body["totals"]["imported"], 150_000);
     assert!(started.elapsed().as_secs() < 60, "{:?}", started.elapsed());
 }
+
+#[tokio::test]
+async fn body_over_its_limit_is_413_and_writes_nothing() {
+    use spotifast_stats_api::import::{MAX_BODY_BYTES, MAX_ZIP_BODY_BYTES};
+    let s = state().await;
+    let (_, token) = user_with_token(&s, "u1").await;
+    // Announced too large: refused before reading the body.
+    for (content_type, limit) in [
+        ("application/zip", MAX_ZIP_BODY_BYTES),
+        ("application/json", MAX_BODY_BYTES),
+    ] {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/import")
+            .header("content-type", content_type)
+            .header("content-length", (limit + 1).to_string())
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from("[]"))
+            .unwrap();
+        let resp = app(s.clone()).oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "{content_type}"
+        );
+    }
+    // Not announced: cut while reading.
+    let mut big = vec![b' '; MAX_BODY_BYTES + 1];
+    big[0] = b'[';
+    let (status, _) = post_raw(&s, Some(&token), "application/json", big).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(count(&s, "plays").await, 0);
+    // Within the limits, an announced length is fine.
+    let body = json!([track("2021-03-01T10:00:00Z", 200_000, "a")]).to_string();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/import")
+        .header("content-type", "application/json")
+        .header("content-length", body.len().to_string())
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app(s.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(count(&s, "plays").await, 1);
+}

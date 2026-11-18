@@ -7,10 +7,15 @@
 //! With `Content-Type: application/zip` the body is the whole export archive:
 //! every `Streaming_History_Audio_*.json` entry (in any folder) is imported, in
 //! name order, in a single transaction, and the response is a per-file report.
-//! Everything else in the archive is ignored. The archive is read in memory
-//! only (nothing is written to disk), with limits on the number of entries, the
-//! path names and the uncompressed size. Files after the first are deduplicated
-//! against the plays stored by the earlier ones.
+//! Everything else in the archive is ignored. The archive is streamed to an
+//! anonymous temporary file (in `TMPDIR`, removed as soon as the import ends,
+//! even on a crash) rather than held in memory, up to [`MAX_ZIP_BODY_BYTES`];
+//! then only the history files are decompressed, one at a time, with limits on
+//! the number of entries, the path names and the uncompressed size. Files after
+//! the first are deduplicated against the plays stored by the earlier ones.
+//!
+//! A body over its limit (from `Content-Length` when sent, else while reading
+//! it) is refused with 413.
 //!
 //! # Duplicates
 //!
@@ -31,17 +36,19 @@
 //! the unique key).
 
 use std::collections::HashMap;
-use std::io::{Cursor, Read};
+use std::io::{Read, Seek};
 
 use axum::Json;
 use axum::Router;
-use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, State};
+use axum::body::Body;
+use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
+use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
 use sqlx::SqliteConnection;
+use tokio::io::AsyncWriteExt;
 
 use crate::AppState;
 use crate::auth::AuthUser;
@@ -51,8 +58,9 @@ use crate::error::{AppError, AppResult};
 /// Maximum accepted body size for a single JSON file (files are tens of MB).
 pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 
-/// Maximum accepted body size for a zip archive (the compressed export).
-pub const MAX_ZIP_BODY_BYTES: usize = 200 * 1024 * 1024;
+/// Maximum accepted body size for a zip archive (the compressed export, a
+/// few MB to about 200 MB; written to a temporary file, not held in memory).
+pub const MAX_ZIP_BODY_BYTES: usize = 512 * 1024 * 1024;
 
 /// Maximum total uncompressed size of the imported files of one archive,
 /// enforced while reading (declared sizes are not trusted).
@@ -73,11 +81,8 @@ pub const DEDUP_WINDOW_MS: i64 = 60_000;
 
 /// Routes of this module.
 pub fn router() -> Router<AppState> {
-    // The route-wide limit fits zips; a single JSON body is capped by hand.
-    Router::new().route(
-        "/import",
-        post(import_history).layer(DefaultBodyLimit::max(MAX_ZIP_BODY_BYTES)),
-    )
+    // The body is read by hand, with the limit of its content type.
+    Router::new().route("/import", post(import_history))
 }
 
 /// One entry of the file; unknown fields are ignored, optional ones may be null.
@@ -238,10 +243,10 @@ struct ParsedArchive {
     ignored: Vec<String>,
 }
 
-/// Read the archive in memory and parse every matching file, in name order.
-/// Any problem is a 400 naming it.
-fn parse_archive(body: Bytes) -> AppResult<ParsedArchive> {
-    let mut archive = zip::ZipArchive::new(Cursor::new(body))
+/// Read the archive and parse every matching file, in name order. Any problem
+/// is a 400 naming it.
+fn parse_archive<R: Read + Seek>(reader: R) -> AppResult<ParsedArchive> {
+    let mut archive = zip::ZipArchive::new(reader)
         .map_err(|e| AppError::BadRequest(format!("invalid zip archive: {e}")))?;
     if archive.len() > MAX_ZIP_ENTRIES {
         return Err(AppError::BadRequest(format!(
@@ -303,15 +308,82 @@ fn parse_archive(body: Bytes) -> AppResult<ParsedArchive> {
     Ok(ParsedArchive { files, ignored })
 }
 
+/// The `Content-Length` the client announced, when it did.
+fn declared_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// The next chunk of the body; `None` at its end.
+async fn next_chunk(body: &mut Body) -> AppResult<Option<axum::body::Bytes>> {
+    while let Some(frame) = body.frame().await {
+        let frame = frame
+            .map_err(|e| AppError::BadRequest(format!("cannot read the request body: {e}")))?;
+        if let Ok(data) = frame.into_data() {
+            return Ok(Some(data));
+        }
+    }
+    Ok(None)
+}
+
+/// The whole body in memory; `None` when it is longer than `limit` bytes.
+async fn read_limited(mut body: Body, limit: usize) -> AppResult<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = next_chunk(&mut body).await? {
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Ok(None);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(Some(bytes))
+}
+
+/// The body written to an anonymous temporary file (deleted when the file is
+/// dropped), rewound; `None` when it is longer than `limit` bytes.
+async fn spool_limited(mut body: Body, limit: usize) -> AppResult<Option<std::fs::File>> {
+    let io_error = |e: std::io::Error| {
+        AppError::Internal(format!("cannot write the upload to a temporary file: {e}"))
+    };
+    let file = tokio::task::spawn_blocking(tempfile::tempfile)
+        .await
+        .map_err(|e| AppError::Internal(format!("temporary file task failed: {e}")))?
+        .map_err(io_error)?;
+    let mut file = tokio::fs::File::from_std(file);
+    let mut written: usize = 0;
+    while let Some(chunk) = next_chunk(&mut body).await? {
+        written = written.saturating_add(chunk.len());
+        if written > limit {
+            return Ok(None);
+        }
+        file.write_all(&chunk).await.map_err(io_error)?;
+    }
+    file.flush().await.map_err(io_error)?;
+    let mut file = file.into_std().await;
+    file.rewind().map_err(io_error)?;
+    Ok(Some(file))
+}
+
 async fn import_history(
     State(state): State<AppState>,
     user: AuthUser,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> AppResult<Response> {
+    let too_large = || -> AppResult<Response> { Ok(StatusCode::PAYLOAD_TOO_LARGE.into_response()) };
     if is_zip(&headers) {
+        if declared_length(&headers).is_some_and(|n| n > MAX_ZIP_BODY_BYTES as u64) {
+            return too_large();
+        }
+        let Some(file) = spool_limited(body, MAX_ZIP_BODY_BYTES).await? else {
+            return too_large();
+        };
         // Decompression and parsing are CPU work: keep them off the async threads.
-        let parsed = tokio::task::spawn_blocking(move || parse_archive(body))
+        let parsed = tokio::task::spawn_blocking(move || parse_archive(file))
             .await
             .map_err(|e| AppError::Internal(format!("zip task failed: {e}")))??;
 
@@ -337,9 +409,12 @@ async fn import_history(
         .into_response());
     }
 
-    if body.len() > MAX_BODY_BYTES {
-        return Ok(StatusCode::PAYLOAD_TOO_LARGE.into_response());
+    if declared_length(&headers).is_some_and(|n| n > MAX_BODY_BYTES as u64) {
+        return too_large();
     }
+    let Some(body) = read_limited(body, MAX_BODY_BYTES).await? else {
+        return too_large();
+    };
     // Validate everything before touching the database.
     let ParsedFile {
         mut counts,
