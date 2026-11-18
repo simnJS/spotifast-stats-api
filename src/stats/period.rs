@@ -70,6 +70,21 @@ impl Period {
             to: i64::MAX,
         })
     }
+
+    /// The period of the same length that ends where this one starts, for
+    /// rank changes. An open end stands for `now_ms`. `None` when this one has
+    /// no start (lifetime) or is empty.
+    pub fn previous(&self, now_ms: i64) -> Option<Self> {
+        if self.from == i64::MIN {
+            return None;
+        }
+        let end = if self.to == i64::MAX { now_ms } else { self.to };
+        let length = end.checked_sub(self.from).filter(|l| *l > 0)?;
+        Some(Self {
+            from: self.from.checked_sub(length)?,
+            to: self.from,
+        })
+    }
 }
 
 /// Parse the `limit` parameter (default 50, between 1 and 200).
@@ -101,5 +116,53 @@ pub fn parse_offset(value: Option<&str>) -> AppResult<i64> {
             }
             Ok(n)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 2027-01-15T08:00:00Z.
+    const NOW: i64 = 1_800_000_000_000;
+    const DAY: i64 = 86_400_000;
+
+    fn previous(range: Option<&str>, from: Option<&str>, to: Option<&str>) -> Option<(i64, i64)> {
+        Period::resolve(range, from, to, NOW)
+            .unwrap()
+            .previous(NOW)
+            .map(|p| (p.from, p.to))
+    }
+
+    #[test]
+    fn previous_period_has_the_same_length_and_ends_where_it_starts() {
+        assert_eq!(
+            previous(Some("4w"), None, None),
+            Some((NOW - 56 * DAY, NOW - 28 * DAY))
+        );
+        let six = Period::resolve(Some("6m"), None, None, NOW).unwrap();
+        let before = six.previous(NOW).unwrap();
+        assert_eq!(before.to, six.from);
+        assert_eq!(six.from - before.from, NOW - six.from);
+        assert_eq!(
+            previous(None, Some("1000"), Some("3000")),
+            Some((-1000, 1000))
+        );
+        // An open end stands for now.
+        let from = (NOW - DAY).to_string();
+        assert_eq!(
+            previous(None, Some(&from), None),
+            Some((NOW - 2 * DAY, NOW - DAY))
+        );
+    }
+
+    #[test]
+    fn lifetime_and_open_starts_have_no_previous_period() {
+        assert_eq!(previous(None, None, None), None);
+        assert_eq!(previous(Some("lifetime"), None, None), None);
+        assert_eq!(previous(None, None, Some("1000")), None);
+        // Starting after now with an open end: empty, nothing before.
+        let later = (NOW + DAY).to_string();
+        assert_eq!(previous(None, Some(&later), None), None);
     }
 }

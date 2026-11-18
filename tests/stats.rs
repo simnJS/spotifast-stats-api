@@ -2,8 +2,12 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
+use spotifast_stats_api::clock::Clock;
 use spotifast_stats_api::config::Config;
-use spotifast_stats_api::db::{PlaySource, insert_play, insert_test_user, upsert_track};
+use spotifast_stats_api::db::{
+    AlbumMetadata, ArtistDetails, ArtistRef, PlaySource, TrackMetadata, insert_play,
+    insert_test_user, store_artist_details, store_track_metadata, upsert_track,
+};
 use spotifast_stats_api::{AppState, app, auth, db};
 use tower::ServiceExt;
 
@@ -178,11 +182,17 @@ async fn stats_range_filters_relative_to_now() {
 async fn stats_top_tracks_sorting_and_pagination() {
     let s = seeded().await;
     let by_plays = ok(&s.state, "/stats/top/tracks", &s.a).await;
+    // Without Spotify metadata yet: names only, no artist or album id.
     assert_eq!(
         by_plays["items"][0],
         json!({
-            "spotify_id": "s3", "name": "Song3", "artist_name": "ArtistY",
-            "album_name": "AlbumQ", "plays": 3, "ms_played": 150_000,
+            "rank": 1, "previous_rank": null,
+            "spotify_id": "s3", "uri": "spotify:track:s3", "name": "Song3",
+            "image_url": null, "duration_ms": 1,
+            "artists": [{ "spotify_id": null, "name": "ArtistY" }],
+            "album": { "spotify_id": null, "name": "AlbumQ", "image_url": null },
+            "artist_name": "ArtistY", "album_name": "AlbumQ",
+            "plays": 3, "ms_played": 150_000,
         })
     );
     assert_eq!(
@@ -206,6 +216,8 @@ async fn stats_top_tracks_sorting_and_pagination() {
 
     let page = ok(&s.state, "/stats/top/tracks?limit=2&offset=1", &s.a).await;
     assert_eq!(names(&page, "name"), ["Song1", "Song4"]);
+    assert_eq!(page["items"][0]["rank"], 2);
+    assert_eq!(page["items"][1]["rank"], 3);
     let beyond = ok(&s.state, "/stats/top/tracks?offset=10", &s.a).await;
     assert_eq!(beyond["items"], json!([]));
 
@@ -221,8 +233,16 @@ async fn stats_top_artists_group_by_artist() {
     assert_eq!(
         body["items"],
         json!([
-            { "artist_name": "ArtistX", "plays": 4, "ms_played": 1_000_000 },
-            { "artist_name": "ArtistY", "plays": 3, "ms_played": 150_000 },
+            {
+                "rank": 1, "previous_rank": null,
+                "spotify_id": null, "uri": null, "name": "ArtistX", "image_url": null,
+                "artist_name": "ArtistX", "plays": 4, "ms_played": 1_000_000,
+            },
+            {
+                "rank": 2, "previous_rank": null,
+                "spotify_id": null, "uri": null, "name": "ArtistY", "image_url": null,
+                "artist_name": "ArtistY", "plays": 3, "ms_played": 150_000,
+            },
         ])
     );
     let page = ok(&s.state, "/stats/top/artists?limit=1&offset=1", &s.a).await;
@@ -234,12 +254,20 @@ async fn stats_top_albums_group_by_album_and_artist() {
     let s = seeded().await;
     // Plays tie (3 vs 3): broken by ms_played.
     let by_plays = ok(&s.state, "/stats/top/albums", &s.a).await;
+    let album = |rank: i64, name: &str, artist: &str, plays: i64, ms: i64| {
+        json!({
+            "rank": rank, "previous_rank": null,
+            "spotify_id": null, "uri": null, "name": name, "image_url": null,
+            "artists": [{ "spotify_id": null, "name": artist }],
+            "album_name": name, "artist_name": artist, "plays": plays, "ms_played": ms,
+        })
+    };
     assert_eq!(
         by_plays["items"],
         json!([
-            { "album_name": "AlbumP", "artist_name": "ArtistX", "plays": 3, "ms_played": 600_000 },
-            { "album_name": "AlbumQ", "artist_name": "ArtistY", "plays": 3, "ms_played": 150_000 },
-            { "album_name": "AlbumR", "artist_name": "ArtistX", "plays": 1, "ms_played": 400_000 },
+            album(1, "AlbumP", "ArtistX", 3, 600_000),
+            album(2, "AlbumQ", "ArtistY", 3, 150_000),
+            album(3, "AlbumR", "ArtistX", 1, 400_000),
         ])
     );
     let by_duration = ok(&s.state, "/stats/top/albums?sort=duration", &s.a).await;
@@ -687,6 +715,8 @@ async fn stats_time_zone_errors_give_400() {
         "/stats/hours?tz=Europe/Paris&range=bad",
         "/stats/streaks?tz=Nope",
         "/stats/streaks?tz=",
+        "/stats/listening-time?bucket=day&tz=Nope",
+        "/stats/listening-time?bucket=day&tz=",
     ] {
         let (status, body) = get(&s.state, uri, Some(&s.a)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
@@ -878,10 +908,560 @@ async fn stats_compare_errors() {
 async fn stats_new_endpoints_require_authentication() {
     let s = seeded().await;
     let compare = format!("/stats/compare?with={}", s.ub);
-    for uri in ["/stats/hours", "/stats/streaks", compare.as_str()] {
+    for uri in [
+        "/stats/hours",
+        "/stats/streaks",
+        compare.as_str(),
+        "/stats/top/genres",
+        "/stats/item/track/s1",
+        "/stats/item/artist/a1",
+        "/stats/item/album/al1",
+    ] {
         let (status, _) = get(&s.state, uri, None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
         let (status, _) = get(&s.state, uri, Some("bogus")).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri} bogus");
     }
+}
+
+// ---- ranks, Spotify metadata, genres, time zones, items -------------------
+
+/// "Now" of the tests on a simulated clock: 2027-01-15T08:00:00Z.
+const NOW: i64 = 1_800_000_000_000;
+
+async fn state_at(now_ms: i64) -> AppState {
+    AppState::new(db::test_pool().await, Config::for_tests()).with_clock(Clock::simulated(now_ms))
+}
+
+/// (name, rank, previous_rank) of each item, `key` naming it.
+fn ranks(body: &Value, key: &str) -> Vec<(String, i64, Option<i64>)> {
+    body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| {
+            (
+                i[key].as_str().unwrap().to_string(),
+                i["rank"].as_i64().unwrap(),
+                i["previous_rank"].as_i64(),
+            )
+        })
+        .collect()
+}
+
+fn r(name: &str, rank: i64, previous: Option<i64>) -> (String, i64, Option<i64>) {
+    (name.to_string(), rank, previous)
+}
+
+#[tokio::test]
+async fn stats_previous_rank_compares_with_the_period_before() {
+    let state = state_at(NOW).await;
+    let pool = &state.pool;
+    let u = insert_test_user(pool, "p").await.unwrap();
+    let mut ids = Vec::new();
+    for (id, name, artist) in [
+        ("ta", "A", "Ar1"),
+        ("tb", "B", "Ar2"),
+        ("tc", "C", "Ar3"),
+        ("td", "D", "Ar4"),
+    ] {
+        let album = format!("Al{name}");
+        ids.push(
+            upsert_track(pool, id, name, artist, &album, None)
+                .await
+                .unwrap(),
+        );
+    }
+    let &[a, b, c, d] = &ids[..] else {
+        unreachable!()
+    };
+    // The 28 days before the last 28: A 3 plays, B 2, C 1.
+    let before = NOW - 40 * DAY;
+    for (t, n) in [(a, 3), (b, 2), (c, 1)] {
+        for i in 0..n {
+            play(&state, u, t, before + i * HOUR, 1_000).await;
+        }
+    }
+    // The last 28 days (their first instant included): B 3, C 2, D 1, A none.
+    let start = NOW - 28 * DAY;
+    for at in [start, start + HOUR, start + 2 * HOUR] {
+        play(&state, u, b, at, 1_000).await;
+    }
+    play(&state, u, c, NOW - DAY, 1_000).await;
+    play(&state, u, c, NOW - DAY + HOUR, 1_000).await;
+    play(&state, u, d, NOW - HOUR, 1_000).await;
+    // Before both periods: counts for neither.
+    play(&state, u, d, NOW - 100 * DAY, 1_000).await;
+    let token = auth::issue_token(pool, u).await.unwrap();
+
+    let tracks = ok(&state, "/stats/top/tracks?range=4w", &token).await;
+    assert_eq!(
+        ranks(&tracks, "name"),
+        [r("B", 1, Some(2)), r("C", 2, Some(3)), r("D", 3, None)]
+    );
+    let artists = ok(&state, "/stats/top/artists?range=4w", &token).await;
+    assert_eq!(
+        ranks(&artists, "name"),
+        [
+            r("Ar2", 1, Some(2)),
+            r("Ar3", 2, Some(3)),
+            r("Ar4", 3, None)
+        ]
+    );
+    let albums = ok(&state, "/stats/top/albums?range=4w", &token).await;
+    assert_eq!(
+        ranks(&albums, "name"),
+        [
+            r("AlB", 1, Some(2)),
+            r("AlC", 2, Some(3)),
+            r("AlD", 3, None)
+        ]
+    );
+    // The rank over the period before is its full ranking's, whatever the page.
+    let page = ok(
+        &state,
+        "/stats/top/tracks?range=4w&limit=1&offset=1",
+        &token,
+    )
+    .await;
+    assert_eq!(ranks(&page, "name"), [r("C", 2, Some(3))]);
+
+    // Lifetime has no period before. Ties (A and C: 3 plays, 3 s) by name.
+    let lifetime = ok(&state, "/stats/top/tracks", &token).await;
+    assert_eq!(
+        ranks(&lifetime, "name"),
+        [
+            r("B", 1, None),
+            r("A", 2, None),
+            r("C", 3, None),
+            r("D", 4, None)
+        ]
+    );
+
+    // Explicit bounds: the period before has the same length.
+    let uri = format!("/stats/top/tracks?from={start}&to={}", NOW + 1);
+    assert_eq!(ok(&state, &uri, &token).await, tracks);
+    // An open `to` stands for now: the 2 days before the last 2 have no play.
+    let uri = format!("/stats/top/tracks?from={}", NOW - 2 * DAY);
+    let recent = ok(&state, &uri, &token).await;
+    assert_eq!(ranks(&recent, "name"), [r("C", 1, None), r("D", 2, None)]);
+}
+
+fn artist_ref(spotify_id: &str, name: &str) -> ArtistRef {
+    ArtistRef {
+        spotify_id: spotify_id.to_string(),
+        name: name.to_string(),
+    }
+}
+
+/// A track stored with its Spotify metadata (artists, album with the main
+/// artist); returns its row id.
+async fn track_with_metadata(
+    state: &AppState,
+    spotify_id: &str,
+    name: &str,
+    artists: &[(&str, &str)],
+    album: (&str, &str, Option<&str>),
+) -> i64 {
+    let (main_id, main_name) = artists[0];
+    let track = upsert_track(
+        &state.pool,
+        spotify_id,
+        name,
+        main_name,
+        album.1,
+        Some(200_000),
+    )
+    .await
+    .unwrap();
+    let metadata = TrackMetadata {
+        artists: artists.iter().map(|(id, n)| artist_ref(id, n)).collect(),
+        album: Some(AlbumMetadata {
+            spotify_id: album.0.to_string(),
+            name: album.1.to_string(),
+            image_url: album.2.map(str::to_string),
+            artists: vec![artist_ref(main_id, main_name)],
+        }),
+    };
+    store_track_metadata(&state.pool, track, &metadata, NOW)
+        .await
+        .unwrap();
+    track
+}
+
+async fn artist_details(state: &AppState, spotify_id: &str, image: Option<&str>, genres: &[&str]) {
+    let details = ArtistDetails {
+        name: String::new(),
+        image_url: image.map(str::to_string),
+        genres: genres.iter().map(|g| g.to_string()).collect(),
+    };
+    store_artist_details(&state.pool, spotify_id, &details, NOW)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn stats_metadata_credited_artists_and_genres() {
+    let state = state_at(NOW).await;
+    let pool = &state.pool;
+    let u = insert_test_user(pool, "g").await.unwrap();
+    let duet = [("a1", "Artist One"), ("a2", "Artist Two")];
+    let t1 = track_with_metadata(
+        &state,
+        "t1",
+        "Duet",
+        &duet,
+        ("al1", "First", Some("https://img/al1")),
+    )
+    .await;
+    let t2 = track_with_metadata(&state, "t2", "Solo", &duet[1..], ("al2", "Second", None)).await;
+    // Imported, not backfilled: by Artist One's name, on its album's name.
+    let t3 = upsert_track(pool, "t3", "Old", "Artist One", "First", None)
+        .await
+        .unwrap();
+    // Imported, nothing known of its artist.
+    let t4 = upsert_track(pool, "t4", "Unknown", "Nobody", "Nowhere", None)
+        .await
+        .unwrap();
+    artist_details(&state, "a1", Some("https://img/a1"), &["pop", "rock"]).await;
+    artist_details(&state, "a2", None, &["pop"]).await;
+    // The last 4 weeks.
+    play(&state, u, t1, NOW - 3 * HOUR, 100_000).await;
+    play(&state, u, t1, NOW - 2 * HOUR, 100_000).await;
+    play(&state, u, t2, NOW - HOUR, 50_000).await;
+    play(&state, u, t3, NOW - DAY, 10_000).await;
+    play(&state, u, t4, NOW - 2 * DAY, 5_000).await;
+    // The 4 weeks before: Solo three times.
+    for i in 0..3 {
+        play(&state, u, t2, NOW - 30 * DAY + i * HOUR, 1_000).await;
+    }
+    let token = auth::issue_token(pool, u).await.unwrap();
+
+    // A play counts once for each of its artists' genres (Duet: pop once).
+    let genres = ok(&state, "/stats/top/genres?range=4w", &token).await;
+    assert_eq!(
+        genres["items"],
+        json!([
+            { "genre": "pop", "rank": 1, "previous_rank": 1, "plays": 4, "ms_played": 260_000 },
+            { "genre": "rock", "rank": 2, "previous_rank": null, "plays": 3, "ms_played": 210_000 },
+        ])
+    );
+    let by_duration = ok(
+        &state,
+        "/stats/top/genres?range=4w&sort=duration&limit=1",
+        &token,
+    )
+    .await;
+    assert_eq!(ranks(&by_duration, "genre"), [r("pop", 1, Some(1))]);
+
+    // Every credited artist counts the play; the imported track counts for the
+    // stored artist of its name.
+    let artists = ok(&state, "/stats/top/artists?range=4w", &token).await;
+    assert_eq!(
+        artists["items"],
+        json!([
+            {
+                "rank": 1, "previous_rank": 1, "spotify_id": "a2", "uri": "spotify:artist:a2",
+                "name": "Artist Two", "image_url": null, "artist_name": "Artist Two",
+                "plays": 3, "ms_played": 250_000,
+            },
+            {
+                "rank": 2, "previous_rank": null, "spotify_id": "a1", "uri": "spotify:artist:a1",
+                "name": "Artist One", "image_url": "https://img/a1", "artist_name": "Artist One",
+                "plays": 3, "ms_played": 210_000,
+            },
+            {
+                "rank": 3, "previous_rank": null, "spotify_id": null, "uri": null,
+                "name": "Nobody", "image_url": null, "artist_name": "Nobody",
+                "plays": 1, "ms_played": 5_000,
+            },
+        ])
+    );
+
+    let tracks = ok(&state, "/stats/top/tracks?range=4w", &token).await;
+    assert_eq!(
+        tracks["items"][0],
+        json!({
+            "rank": 1, "previous_rank": null,
+            "spotify_id": "t1", "uri": "spotify:track:t1", "name": "Duet",
+            "image_url": "https://img/al1", "duration_ms": 200_000,
+            "artists": [
+                { "spotify_id": "a1", "name": "Artist One" },
+                { "spotify_id": "a2", "name": "Artist Two" },
+            ],
+            "album": { "spotify_id": "al1", "name": "First", "image_url": "https://img/al1" },
+            "artist_name": "Artist One", "album_name": "First",
+            "plays": 2, "ms_played": 200_000,
+        })
+    );
+    assert_eq!(
+        ranks(&tracks, "name"),
+        [
+            r("Duet", 1, None),
+            r("Solo", 2, Some(1)),
+            r("Old", 3, None),
+            r("Unknown", 4, None)
+        ]
+    );
+    let old = &tracks["items"][2];
+    assert_eq!(
+        old["artists"],
+        json!([{ "spotify_id": "a1", "name": "Artist One" }])
+    );
+    assert_eq!(old["album"]["spotify_id"], "al1");
+    assert_eq!(old["image_url"], "https://img/al1");
+    assert_eq!(old["duration_ms"], Value::Null);
+
+    let albums = ok(&state, "/stats/top/albums?range=4w", &token).await;
+    assert_eq!(
+        albums["items"][0],
+        json!({
+            "rank": 1, "previous_rank": null, "spotify_id": "al1", "uri": "spotify:album:al1",
+            "name": "First", "image_url": "https://img/al1",
+            "artists": [{ "spotify_id": "a1", "name": "Artist One" }],
+            "album_name": "First", "artist_name": "Artist One",
+            "plays": 3, "ms_played": 210_000,
+        })
+    );
+    assert_eq!(
+        ranks(&albums, "name"),
+        [
+            r("First", 1, None),
+            r("Second", 2, Some(1)),
+            r("Nowhere", 3, None)
+        ]
+    );
+
+    let summary = ok(&state, "/stats/summary?range=4w", &token).await;
+    assert_eq!(summary["plays"], 5);
+    assert_eq!(summary["distinct_tracks"], 4);
+    assert_eq!(summary["distinct_artists"], 3);
+    assert_eq!(summary["distinct_albums"], 3);
+}
+
+#[tokio::test]
+async fn stats_genres_are_empty_without_spotify_genres() {
+    let s = seeded().await;
+    let body = ok(&s.state, "/stats/top/genres", &s.a).await;
+    assert_eq!(body, json!({ "items": [] }));
+    for uri in [
+        "/stats/top/genres?sort=name",
+        "/stats/top/genres?limit=0",
+        "/stats/top/genres?range=2w",
+    ] {
+        let (status, _) = get(&s.state, uri, Some(&s.a)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn stats_listening_time_follows_the_time_zone() {
+    let state = state().await;
+    let (u, t, token) = user_with_track(&state, "lt").await;
+    play(&state, u, t, ts("2024-03-30T22:30:00Z"), 1).await; // Paris: Sat 30, 23:30
+    play(&state, u, t, ts("2024-03-30T23:30:00Z"), 2).await; // Paris: Sun 31, 00:30
+    play(&state, u, t, ts("2024-03-31T21:30:00Z"), 4).await; // Paris: Sun 31, 23:30 (summer)
+    play(&state, u, t, ts("2024-03-31T22:30:00Z"), 8).await; // Paris: Mon Apr 1, 00:30
+
+    let utc = ok(&state, "/stats/listening-time?bucket=day", &token).await;
+    assert_eq!(
+        utc["items"],
+        json!([
+            { "start": ts("2024-03-30T00:00:00Z"), "plays": 2, "ms_played": 3 },
+            { "start": ts("2024-03-31T00:00:00Z"), "plays": 2, "ms_played": 12 },
+        ])
+    );
+    assert_eq!(
+        ok(&state, "/stats/listening-time?bucket=day&tz=UTC", &token).await,
+        utc
+    );
+    // Each bucket starts at the zone's midnight, daylight saving time included.
+    let day = ok(
+        &state,
+        "/stats/listening-time?bucket=day&tz=Europe/Paris",
+        &token,
+    )
+    .await;
+    assert_eq!(
+        day["items"],
+        json!([
+            { "start": ts("2024-03-29T23:00:00Z"), "plays": 1, "ms_played": 1 },
+            { "start": ts("2024-03-30T23:00:00Z"), "plays": 2, "ms_played": 6 },
+            { "start": ts("2024-03-31T22:00:00Z"), "plays": 1, "ms_played": 8 },
+        ])
+    );
+    let week = ok(
+        &state,
+        "/stats/listening-time?bucket=week&tz=Europe/Paris",
+        &token,
+    )
+    .await;
+    assert_eq!(
+        week["items"],
+        json!([
+            { "start": ts("2024-03-24T23:00:00Z"), "plays": 3, "ms_played": 7 },
+            { "start": ts("2024-03-31T22:00:00Z"), "plays": 1, "ms_played": 8 },
+        ])
+    );
+    let month = ok(
+        &state,
+        "/stats/listening-time?bucket=month&tz=Europe/Paris",
+        &token,
+    )
+    .await;
+    assert_eq!(
+        month["items"],
+        json!([
+            { "start": ts("2024-02-29T23:00:00Z"), "plays": 3, "ms_played": 7 },
+            { "start": ts("2024-03-31T22:00:00Z"), "plays": 1, "ms_played": 8 },
+        ])
+    );
+    let utc_month = ok(&state, "/stats/listening-time?bucket=month", &token).await;
+    assert_eq!(
+        utc_month["items"],
+        json!([{ "start": ts("2024-03-01T00:00:00Z"), "plays": 4, "ms_played": 15 }])
+    );
+}
+
+#[tokio::test]
+async fn stats_listening_time_day_skipping_midnight_starts_after_the_gap() {
+    let state = state().await;
+    let (u, t, token) = user_with_track(&state, "lt2").await;
+    // Santiago moves from -04 to -03 at midnight on 2024-09-08: that day
+    // starts at 01:00 local, 04:00 UTC.
+    play(&state, u, t, ts("2024-09-08T15:00:00Z"), 1).await;
+    let body = ok(
+        &state,
+        "/stats/listening-time?bucket=day&tz=America/Santiago",
+        &token,
+    )
+    .await;
+    assert_eq!(
+        body["items"],
+        json!([{ "start": ts("2024-09-08T04:00:00Z"), "plays": 1, "ms_played": 1 }])
+    );
+}
+
+#[tokio::test]
+async fn stats_item_figures_ranks_and_top_tracks() {
+    let state = state_at(NOW).await;
+    let pool = &state.pool;
+    let u = insert_test_user(pool, "i").await.unwrap();
+    let v = insert_test_user(pool, "j").await.unwrap();
+    let duet = [("a1", "Artist One"), ("a2", "Artist Two")];
+    let t1 = track_with_metadata(&state, "t1", "Duet", &duet, ("al1", "First", None)).await;
+    let t2 = track_with_metadata(&state, "t2", "Solo", &duet[1..], ("al2", "Second", None)).await;
+    let mut third = Vec::new();
+    for k in 3..=8 {
+        let id = format!("t{k}");
+        let name = format!("Song{k}");
+        third.push(
+            track_with_metadata(
+                &state,
+                &id,
+                &name,
+                &[("a3", "Artist Three")],
+                ("al3", "Third", None),
+            )
+            .await,
+        );
+    }
+    // Only the other user plays a9.
+    let t9 = track_with_metadata(
+        &state,
+        "t9",
+        "Theirs",
+        &[("a9", "Artist Nine")],
+        ("al9", "Ninth", None),
+    )
+    .await;
+    play(&state, v, t9, NOW - HOUR, 1_000).await;
+    // Artist Three: Song3 6 plays, Song4 5, ... Song8 1, long ago.
+    let long_ago = NOW - 100 * DAY;
+    for (n, track) in third.iter().enumerate() {
+        for i in 0..(6 - n as i64) {
+            play(
+                &state,
+                u,
+                *track,
+                long_ago + (10 * n as i64 + i) * HOUR,
+                1_000,
+            )
+            .await;
+        }
+    }
+    // Duet 4 times, 50 days ago; Solo twice 60 days ago and once yesterday.
+    for i in 0..4 {
+        play(&state, u, t1, NOW - 50 * DAY + i * HOUR, 1_000).await;
+    }
+    play(&state, u, t2, NOW - 60 * DAY, 1_000).await;
+    play(&state, u, t2, NOW - 60 * DAY + HOUR, 1_000).await;
+    play(&state, u, t2, NOW - DAY, 1_000).await;
+    let token = auth::issue_token(pool, u).await.unwrap();
+
+    let two = ok(&state, "/stats/item/artist/a2", &token).await;
+    assert_eq!(
+        two,
+        json!({
+            "plays": 7, "ms_played": 7_000,
+            "first_played_at": NOW - 60 * DAY, "last_played_at": NOW - DAY,
+            "rank_lifetime": 2, "rank_4w": 1,
+            "top_tracks": [
+                { "spotify_id": "t1", "name": "Duet", "plays": 4, "ms_played": 4_000 },
+                { "spotify_id": "t2", "name": "Solo", "plays": 3, "ms_played": 3_000 },
+            ],
+        })
+    );
+    let one = ok(&state, "/stats/item/artist/a1", &token).await;
+    assert_eq!(one["plays"], 4);
+    assert_eq!(one["rank_lifetime"], 3);
+    assert_eq!(one["rank_4w"], Value::Null);
+
+    // At most 5 top tracks, most played first.
+    let three = ok(&state, "/stats/item/artist/a3", &token).await;
+    assert_eq!(three["plays"], 21);
+    assert_eq!(three["rank_lifetime"], 1);
+    assert_eq!(three["rank_4w"], Value::Null);
+    let top: Vec<(String, i64)> = three["top_tracks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| {
+            (
+                t["name"].as_str().unwrap().to_string(),
+                t["plays"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    let expected: Vec<(String, i64)> = (3..=7).map(|k| (format!("Song{k}"), 9 - k)).collect();
+    assert_eq!(top, expected);
+    let album = ok(&state, "/stats/item/album/al3", &token).await;
+    assert_eq!(album["plays"], 21);
+    assert_eq!(album["rank_lifetime"], 1);
+    assert_eq!(album["top_tracks"], three["top_tracks"]);
+
+    // Tracks: 6, 5, then Duet and Song5 (4 plays, name order), Solo and Song6.
+    let solo = ok(&state, "/stats/item/track/t2", &token).await;
+    assert_eq!(
+        solo,
+        json!({
+            "plays": 3, "ms_played": 3_000,
+            "first_played_at": NOW - 60 * DAY, "last_played_at": NOW - DAY,
+            "rank_lifetime": 5, "rank_4w": 1, "top_tracks": [],
+        })
+    );
+
+    // Never played by this user: 404, even if another user did.
+    for uri in [
+        "/stats/item/track/nope",
+        "/stats/item/artist/a9",
+        "/stats/item/album/al9",
+        "/stats/item/track/t9",
+    ] {
+        let (status, body) = get(&state, uri, Some(&token)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+        assert!(body["error"].is_string(), "{uri}");
+    }
+    let (status, _) = get(&state, "/stats/item/playlist/t1", Some(&token)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
