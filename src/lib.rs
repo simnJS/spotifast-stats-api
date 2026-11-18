@@ -11,6 +11,7 @@ pub mod spotify;
 pub mod stats;
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
@@ -34,6 +35,11 @@ pub struct AppState {
     pub http: reqwest::Client,
     /// Time source: the system clock, simulated in tests.
     pub clock: Clock,
+    /// Whether Spotify still serves the batch lookups (`/tracks?ids=`,
+    /// `/artists?ids=`) to this app: cleared the first time it refuses one
+    /// (Development Mode apps lost them in 2026), the metadata backfill then
+    /// looks items up one by one.
+    pub spotify_batch_lookups: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -43,6 +49,7 @@ impl AppState {
             config: Arc::new(config),
             http: reqwest::Client::new(),
             clock: Clock::system(),
+            spotify_batch_lookups: Arc::new(AtomicBool::new(true)),
         }
     }
 

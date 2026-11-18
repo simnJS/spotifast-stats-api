@@ -28,6 +28,10 @@ pub struct Config {
     /// `AUTH_RATE_LIMIT_PER_MIN`: requests per minute and per client IP
     /// allowed on `/auth/login` and `/auth/callback`.
     pub auth_rate_limit_per_min: u32,
+    /// `METADATA_CALLS_PER_TICK`: Spotify calls the metadata backfill may make
+    /// per poller tick (every 15 s) to read the ids, images and genres of
+    /// imported tracks and of artists. 0 turns the backfill off.
+    pub metadata_calls_per_tick: u32,
 }
 
 /// Smallest `POLL_INTERVAL_SECS` accepted without `POLL_ALLOW_FAST=true`.
@@ -119,6 +123,10 @@ impl Config {
             .ok()
             .filter(|v| *v > 0)
             .ok_or_else(|| ConfigError::Invalid("AUTH_RATE_LIMIT_PER_MIN", rate.clone()))?;
+        let metadata = or_default("METADATA_CALLS_PER_TICK", "4");
+        let metadata_calls_per_tick = metadata
+            .parse::<u32>()
+            .map_err(|_| ConfigError::Invalid("METADATA_CALLS_PER_TICK", metadata.clone()))?;
         Ok(Self {
             database_url: or_default("DATABASE_URL", "sqlite://data/spotifast.db"),
             bind_addr: or_default("BIND_ADDR", "0.0.0.0:8080"),
@@ -135,6 +143,7 @@ impl Config {
             allowed_spotify_ids,
             trust_x_forwarded_for,
             auth_rate_limit_per_min,
+            metadata_calls_per_tick,
         })
     }
 
@@ -153,6 +162,7 @@ impl Config {
             allowed_spotify_ids: None,
             trust_x_forwarded_for: false,
             auth_rate_limit_per_min: 20,
+            metadata_calls_per_tick: 4,
         }
     }
 }
@@ -183,6 +193,7 @@ mod tests {
         assert_eq!(c.allowed_spotify_ids, None);
         assert!(!c.trust_x_forwarded_for);
         assert_eq!(c.auth_rate_limit_per_min, 20);
+        assert_eq!(c.metadata_calls_per_tick, 4);
     }
 
     #[test]
@@ -196,6 +207,7 @@ mod tests {
             ("ALLOWED_SPOTIFY_IDS", " alice, bob ,,"),
             ("TRUST_X_FORWARDED_FOR", "true"),
             ("AUTH_RATE_LIMIT_PER_MIN", "5"),
+            ("METADATA_CALLS_PER_TICK", "0"),
         ])))
         .unwrap();
         assert_eq!(c.poll_interval_secs, 600);
@@ -206,6 +218,7 @@ mod tests {
         );
         assert!(c.trust_x_forwarded_for);
         assert_eq!(c.auth_rate_limit_per_min, 5);
+        assert_eq!(c.metadata_calls_per_tick, 0);
     }
 
     #[test]
@@ -256,6 +269,20 @@ mod tests {
         assert!(matches!(
             with(&[("POLL_ALLOW_FAST", "maybe")]),
             Err(ConfigError::Invalid("POLL_ALLOW_FAST", _))
+        ));
+    }
+
+    #[test]
+    fn bad_metadata_budget_fails() {
+        let r = Config::from_lookup(lookup(HashMap::from([
+            ("SPOTIFY_CLIENT_ID", "a"),
+            ("SPOTIFY_CLIENT_SECRET", "b"),
+            ("SPOTIFY_REDIRECT_URI", "c"),
+            ("METADATA_CALLS_PER_TICK", "-1"),
+        ])));
+        assert!(matches!(
+            r,
+            Err(ConfigError::Invalid("METADATA_CALLS_PER_TICK", _))
         ));
     }
 

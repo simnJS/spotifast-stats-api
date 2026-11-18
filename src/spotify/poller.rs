@@ -24,18 +24,22 @@
 //! - a 429 blocks the whole app until now + `Retry-After` (or an exponential
 //!   back-off without one), stored in the database: nothing at all, not even a
 //!   token refresh, is sent to Spotify for anyone before then, and the cycle
-//!   stops at once.
+//!   stops at once;
+//! - each recorded play also stores its track's artists and album (ids,
+//!   cover), and after each cycle the metadata backfill looks up a few
+//!   imported tracks and artists (see [`super::metadata`]).
 
 use std::time::{Duration, Instant};
 
 use rand::Rng;
 
 use super::client::{self, ClientError, RECENTLY_PLAYED_LIMIT};
+use super::metadata::{backfill_metadata, track_metadata};
 use super::rate_limit;
 use crate::AppState;
 use crate::clock::fmt_ms;
 use crate::config::Config;
-use crate::db::{PlaySource, insert_play, upsert_track};
+use crate::db::{PlaySource, insert_play, store_track_metadata, upsert_track};
 
 /// How often the scheduler looks for due users (never more often than
 /// `POLL_INTERVAL_SECS`).
@@ -55,7 +59,7 @@ const PACE_SMOOTHING: f64 = 0.5;
 const MAX_ERROR_CHARS: usize = 300;
 /// `last_error` once Spotify refused the refresh token. While it is set, a new
 /// login (fresh tokens) lifts the back-off, see [`due_users`].
-const RELOGIN_ERROR: &str = "Spotify refused the refresh token (invalid_grant): it was revoked \
+pub(super) const RELOGIN_ERROR: &str = "Spotify refused the refresh token (invalid_grant): it was revoked \
                              or has expired, the user must log in again (GET /auth/login)";
 
 /// Why polling one user failed.
@@ -304,6 +308,10 @@ async fn fetch(
             track.duration_ms,
         )
         .await?;
+        // The page carries the artists' ids and the album's id and cover.
+        if let Some(metadata) = track_metadata(&track) {
+            store_track_metadata(&state.pool, track_id, &metadata, now_ms).await?;
+        }
         let ms_played = track.duration_ms.unwrap_or(0);
         if insert_play(
             &state.pool,
@@ -575,6 +583,8 @@ pub fn spawn_poller(state: AppState) {
         loop {
             ticker.tick().await;
             poll_all_users(&state, state.clock.now_ms()).await;
+            // After the polls: a 429 they got stops the backfill as well.
+            backfill_metadata(&state, state.clock.now_ms()).await;
         }
     });
 }
@@ -664,7 +674,7 @@ fn jittered_ms(interval_secs: i64) -> i64 {
     (interval_secs as f64 * 1000.0 * factor).round() as i64
 }
 
-fn elapsed_ms(since: Instant) -> i64 {
+pub(super) fn elapsed_ms(since: Instant) -> i64 {
     i64::try_from(since.elapsed().as_millis()).unwrap_or(i64::MAX)
 }
 

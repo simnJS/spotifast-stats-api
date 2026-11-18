@@ -1,6 +1,7 @@
 //! Spotify OAuth login, token refresh and the background play poller.
 
 mod client;
+mod metadata;
 mod now_playing;
 mod oauth;
 mod poller;
@@ -11,6 +12,7 @@ use axum::routing::get;
 
 use crate::AppState;
 
+pub use metadata::{Backfill, backfill_metadata};
 pub(crate) use poller::round_tenth;
 pub use poller::{PollError, poll_all_users, poll_user, spawn_poller};
 
