@@ -18,6 +18,7 @@ each user's Spotify plays and serves listening stats.
 | `ALLOWED_SPOTIFY_IDS` | unset | Comma-separated Spotify user ids allowed to log in; unset = anyone Spotify lets through |
 | `TRUST_X_FORWARDED_FOR` | `false` | Take the client IP from `X-Forwarded-For`; set `true` only behind a reverse proxy |
 | `AUTH_RATE_LIMIT_PER_MIN` | `20` | Requests per minute and per IP allowed on `/auth/login` and `/auth/callback` |
+| `METADATA_CALLS_PER_TICK` | `4` | Spotify lookups the metadata backfill may make every 15 s (ids, images and genres of imported tracks and of artists, see [Spotify metadata](#spotify-metadata)); `0` turns it off |
 | `SPOTIFY_API_BASE` | `https://api.spotify.com/v1` | Spotify Web API base (override for tests) |
 | `SPOTIFY_ACCOUNTS_BASE` | `https://accounts.spotify.com` | Spotify accounts base (override for tests) |
 | `RUST_LOG` | `info` | Log filter |
@@ -167,16 +168,18 @@ how the Dockerfile is tested. Pushes to `main` publish
 | POST | `/auth/token` | Bearer | Creates a new API token, returned once |
 | DELETE | `/auth/token/{id}` | Bearer | Revokes one of your tokens (the current one included) |
 | GET | `/stats/summary` | Bearer | Plays, listening time, distinct tracks/artists/albums, first and last play |
-| GET | `/stats/top/tracks` | Bearer | Top tracks |
-| GET | `/stats/top/artists` | Bearer | Top artists |
-| GET | `/stats/top/albums` | Bearer | Top albums |
-| GET | `/stats/listening-time` | Bearer | Plays and listening time per `bucket` (`day`, `week`, `month`), UTC |
+| GET | `/stats/top/tracks` | Bearer | Top tracks, with rank, rank over the period before, ids, artists, album and cover (see [Tops](#tops)) |
+| GET | `/stats/top/artists` | Bearer | Top artists, with rank, rank over the period before, id and image |
+| GET | `/stats/top/albums` | Bearer | Top albums, with rank, rank over the period before, id, artists and cover |
+| GET | `/stats/top/genres` | Bearer | Top genres of the artists played, with rank and rank over the period before |
+| GET | `/stats/item/{kind}/{spotify_id}` | Bearer | One track, artist or album (`kind` = `track`, `artist`, `album`): plays, time, first and last play, lifetime and 4-week rank, top tracks (see [Item](#item)) |
+| GET | `/stats/listening-time` | Bearer | Plays and listening time per `bucket` (`day`, `week`, `month`) in time zone `tz` |
 | GET | `/stats/hours` | Bearer | Plays per hour of day (24) and per weekday (7), in time zone `tz` |
 | GET | `/stats/streaks` | Bearer | Current and longest run of consecutive listening days, in time zone `tz` |
 | GET | `/stats/compare?with=<user_id>` | Bearer | Artists and tracks in common with another user of the instance, and a similarity score |
 | GET | `/history` | Bearer | Plays, newest first |
 | GET | `/now-playing` | Bearer | What you are listening to right now (cached 30 s); 204 when nothing plays; while Spotify rate limits the app, the last answer, or `503` with `Retry-After` |
-| POST | `/import` | Bearer | Imports a Spotify extended streaming history file, or the whole export zip |
+| POST | `/import` | Bearer | Imports a Spotify extended streaming history file (64 MB max), or the whole export zip (512 MB max) |
 
 Authenticated routes expect `Authorization: Bearer <token>`. Errors are JSON:
 `{"error": "..."}`.
@@ -275,7 +278,8 @@ warning would show it.
 ### When Spotify rate limits the app
 
 Spotify's quota belongs to the app, not to a user, so a 429 on any call (the
-poller, `/now-playing`, a token refresh, a login) blocks the whole app: no call
+poller, `/now-playing`, the metadata backfill, a token refresh, a login) blocks
+the whole app: no call
 at all is sent to Spotify, for anyone, before `Retry-After` has passed (without
 a usable `Retry-After`: 1 min, doubled while the 429s follow one another, up to
 1 h). The end of the block is stored in the database, so it holds across
@@ -284,6 +288,8 @@ restarts, and the log says so at startup. Meanwhile:
 - the poller skips its cycles; the users left are polled once the block is
   over, and the cursor guarantees no play readable then is missed;
 - `/now-playing` answers its last cached answer, or `503` with `Retry-After`;
+- the [metadata backfill](#spotify-metadata) sends nothing; it resumes after
+  the block;
 - `/auth/login`, and `/auth/callback` when Spotify answers 429 during the
   login (token exchange or profile), answer `503` with `Retry-After` and
   « Spotify limite l’app jusqu’à HH:MM UTC » (the end, rounded up to the
@@ -297,8 +303,11 @@ restarts, and the log says so at startup. Meanwhile:
 - Period (all `/stats/*` routes except `/stats/streaks`): `range` = `4w`, `6m`,
   `1y` or `lifetime` (default), or `from` / `to` (unix milliseconds or RFC
   3339, `to` exclusive). `range` cannot be combined with `from` / `to`.
-- Time zone (`/stats/hours`, `/stats/streaks`): `tz`, an IANA name such as
-  `Europe/Paris` (default `UTC`).
+- Time zone (`/stats/listening-time`, `/stats/hours`, `/stats/streaks`): `tz`,
+  an IANA name such as `Europe/Paris` (default `UTC`). Days, weeks (from
+  Monday) and months start at the zone's midnight, daylight saving time
+  included; `listening-time` gives each bucket's first instant as `start`
+  (unix ms) and leaves out empty buckets.
 - Top routes: `sort` = `plays` (default) or `duration`, `limit` (default 50,
   max 200), `offset`.
 - `/stats/compare`: `with` (the other user's id), `limit` (default 20, max
@@ -312,10 +321,146 @@ curl -H "Authorization: Bearer $TOKEN" \
   "https://<your domain>/stats/hours?range=6m&tz=Europe/Paris"
 ```
 
+### What a play counts for
+
+A play counts for its track, for **every artist credited on it** (a featured
+artist too), for its album, and once for each genre of those artists. A track
+whose artists and album are not known yet (imported, not yet looked up, see
+[Spotify metadata](#spotify-metadata)) counts for the artist and album names
+of the history file: for the stored artist (album) of that name when there is
+one, else for a bare name without an id. `/stats/summary`'s
+`distinct_artists` and `distinct_albums` follow the same rule as the tops.
+
+### Tops
+
+`/stats/top/{tracks,artists,albums,genres}` take the period, `sort`, `limit`
+and `offset`, and answer `{"items": [...]}`. Every item has:
+
+| Field | Meaning |
+| --- | --- |
+| `rank` | Its place in the whole ranking (1 = first), in the `sort` order; `offset` + its index + 1 |
+| `previous_rank` | Its place, same order, over the period of the same length that ends where this one starts (`range=4w`: the 28 days before; `6m`/`1y`: as many days before; an open `to` stands for now). `null` when it was not played then (new), and always for `lifetime` or a period without `from` |
+| `plays`, `ms_played` | Plays and listening time in the period |
+
+Up: `previous_rank > rank`; down: `previous_rank < rank`; new: `previous_rank`
+null while the period has a start.
+
+Tracks:
+
+```json
+{
+  "rank": 1, "previous_rank": 3,
+  "spotify_id": "4uLU6hMCjMI75M1A2tKUQC", "uri": "spotify:track:4uLU6hMCjMI75M1A2tKUQC",
+  "name": "Song", "image_url": "https://i.scdn.co/image/…", "duration_ms": 213000,
+  "artists": [{ "spotify_id": "0OdUWJ0sBjDrqHygGUXeCF", "name": "Artist" },
+              { "spotify_id": null, "name": "Not looked up yet" }],
+  "album": { "spotify_id": "1A2GTWGtFfWp7KSQTwWOyo", "name": "Album", "image_url": "https://i.scdn.co/image/…" },
+  "artist_name": "Artist", "album_name": "Album",
+  "plays": 42, "ms_played": 8946000
+}
+```
+
+`image_url` is the album's cover. `artists` are the credited artists, main
+one first. `artist_name` and `album_name` are the former fields, kept.
+
+Artists:
+
+```json
+{
+  "rank": 1, "previous_rank": null,
+  "spotify_id": "0OdUWJ0sBjDrqHygGUXeCF", "uri": "spotify:artist:0OdUWJ0sBjDrqHygGUXeCF",
+  "name": "Artist", "image_url": "https://i.scdn.co/image/…", "artist_name": "Artist",
+  "plays": 120, "ms_played": 25200000
+}
+```
+
+Albums:
+
+```json
+{
+  "rank": 2, "previous_rank": 1,
+  "spotify_id": "1A2GTWGtFfWp7KSQTwWOyo", "uri": "spotify:album:1A2GTWGtFfWp7KSQTwWOyo",
+  "name": "Album", "image_url": "https://i.scdn.co/image/…",
+  "artists": [{ "spotify_id": "0OdUWJ0sBjDrqHygGUXeCF", "name": "Artist" }],
+  "album_name": "Album", "artist_name": "Artist",
+  "plays": 64, "ms_played": 13440000
+}
+```
+
+Genres:
+
+```json
+{ "genre": "french pop", "rank": 1, "previous_rank": 2, "plays": 310, "ms_played": 65100000 }
+```
+
+What can be `null`, and when:
+
+| Field | `null` when |
+| --- | --- |
+| `previous_rank` | not played in the period before, or no period before (`lifetime`) |
+| `spotify_id`, `uri` (artist, album, and in `artists` / `album`) | an imported track not looked up on Spotify yet, or that Spotify does not know, and no stored artist (album) has its name |
+| `image_url` (track, album) | album unknown as above, or Spotify gives no cover |
+| `image_url` (artist) | artist not looked up yet, or Spotify gives no image |
+| `duration_ms` | an imported track not looked up yet, or that Spotify does not know |
+
+A track's own `spotify_id` and `uri` are never null. Genres come from
+Spotify's artist `genres`, which Spotify marks as deprecated and often leaves
+empty: `/stats/top/genres` then has few or no items (it is never made up).
+
+### Item
+
+`GET /stats/item/{kind}/{spotify_id}`, `kind` = `track`, `artist` or `album`,
+looks at the caller's whole history:
+
+```json
+{
+  "plays": 120, "ms_played": 25200000,
+  "first_played_at": 1609459200000, "last_played_at": 1800000000000,
+  "rank_lifetime": 3, "rank_4w": 12,
+  "top_tracks": [
+    { "spotify_id": "4uLU6hMCjMI75M1A2tKUQC", "name": "Song", "plays": 42, "ms_played": 8946000 }
+  ]
+}
+```
+
+`rank_lifetime` and `rank_4w` are its ranks (by plays) in the lifetime and
+last-28-days tops of its kind; `rank_4w` is `null` when it was not played in the
+last 28 days. `top_tracks` are an artist's or an album's 5 most played tracks
+(empty for a track). Times are unix ms. 404 when the caller never played it (or
+it is only known by name, before its lookup); 400 for another `kind`.
+
+### Spotify metadata
+
+Ids, images and genres are stored in the database (`artists`, `albums`,
+`track_artists`, `album_artists`, `artist_genres`):
+
+- a polled play brings them: Spotify's `recently-played` gives the track's
+  artists with their ids and its album with its id and cover;
+- an imported play only has names, so after each poller cycle a backfill looks
+  up a few items on Spotify: tracks without metadata first, the most played
+  (all users) first, then artists without their image and genres. At most
+  `METADATA_CALLS_PER_TICK` lookups every 15 s (default 4), and **none while
+  Spotify rate limits the app**; a 429 it gets blocks the whole app like any
+  other (see [below](#when-spotify-rate-limits-the-app));
+- it asks for 50 items per call (`/tracks?ids=`, `/artists?ids=`) while Spotify
+  serves them. Development Mode apps lost those batch endpoints in 2026: at the
+  first refusal it switches to one call per item (`/tracks/{id}`,
+  `/artists/{id}`) until the next restart. In Development Mode, a full history
+  of a few thousand tracks is therefore looked up over hours, the most played
+  first;
+- an item Spotify does not know is not asked again; it keeps its names.
+
+Until an item is looked up, it is shown with the names of the history file and
+`null` ids and images (see the table above).
 ### Importing your history
 
 Request your **Extended streaming history** from Spotify's privacy page. Send
-the zip Spotify gives you as it is (200 MB max, 1 GB once uncompressed):
+the zip Spotify gives you as it is (512 MB max, 1 GB of history files once
+uncompressed). The upload is written to an anonymous temporary file (in
+`TMPDIR`, `/tmp` by default; deleted when the import ends) rather than held in
+memory, so the server needs that much free disk space there. A body over its
+limit gets `413`. A reverse proxy in front must let such bodies through (Caddy
+does by default; nginx needs `client_max_body_size 512m;`):
 
 ```sh
 curl -X POST -H "Authorization: Bearer $TOKEN" \
@@ -340,3 +485,25 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 Entries under 30 seconds, podcasts and local files are skipped, and so are
 listens already recorded by the poller. Importing the same data twice adds
 nothing.
+
+The answer for a single file:
+
+```json
+{ "received": 15000, "imported": 14200, "skipped_short": 650, "skipped_not_track": 100, "skipped_duplicate": 50 }
+```
+
+For a zip, the same counts per file, their `totals`, and the other files:
+
+```json
+{
+  "files": [
+    { "name": "Spotify Extended Streaming History/Streaming_History_Audio_2021_0.json",
+      "received": 15000, "imported": 14200, "skipped_short": 650, "skipped_not_track": 100, "skipped_duplicate": 50 }
+  ],
+  "totals": { "received": 15000, "imported": 14200, "skipped_short": 650, "skipped_not_track": 100, "skipped_duplicate": 50 },
+  "ignored_files": ["Spotify Extended Streaming History/ReadMeFirst_ExtendedStreamingHistory.pdf"]
+}
+```
+
+The history files only name the tracks: their artists' and albums' ids,
+covers and genres come later, from the [metadata backfill](#spotify-metadata).
