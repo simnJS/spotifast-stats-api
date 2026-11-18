@@ -148,12 +148,56 @@ pub struct TrackObject {
 
 #[derive(Debug, Deserialize)]
 pub struct ArtistObject {
+    pub id: Option<String>,
     pub name: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct AlbumObject {
+    pub id: Option<String>,
     pub name: String,
+    /// Widest first.
+    #[serde(default)]
+    pub images: Option<Vec<ImageObject>>,
+    #[serde(default)]
+    pub artists: Option<Vec<ArtistObject>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImageObject {
+    pub url: Option<String>,
+}
+
+/// A full artist object (`GET /artists/{id}`): only what is used.
+#[derive(Debug, Deserialize)]
+pub struct FullArtist {
+    pub name: String,
+    /// Widest first.
+    #[serde(default)]
+    pub images: Option<Vec<ImageObject>>,
+    /// Deprecated by Spotify and often empty.
+    #[serde(default)]
+    pub genres: Option<Vec<String>>,
+}
+
+/// The URL of the widest image (Spotify lists them widest first).
+pub fn widest_image(images: Option<&[ImageObject]>) -> Option<String> {
+    images?
+        .iter()
+        .find_map(|i| i.url.clone().filter(|u| !u.is_empty()))
+}
+
+/// Ids per batch lookup (`/tracks?ids=`, `/artists?ids=`), Spotify's maximum.
+pub const MAX_IDS_PER_LOOKUP: usize = 50;
+
+#[derive(Debug, Deserialize)]
+struct SeveralTracks {
+    tracks: Vec<Option<TrackObject>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SeveralArtists {
+    artists: Vec<Option<FullArtist>>,
 }
 
 /// Body of `GET /me/player/currently-playing` (only what is used).
@@ -419,6 +463,84 @@ pub async fn get_currently_playing(
         return Ok(None);
     }
     parse(resp, Service::WebApi, what).await.map(Some)
+}
+
+/// Several tracks in one call (`GET /tracks?ids=`, at most
+/// [`MAX_IDS_PER_LOOKUP`] ids): one entry per id, in order, `None` for an id
+/// Spotify does not know. Development Mode apps no longer have it (403).
+pub async fn get_several_tracks(
+    state: &AppState,
+    access_token: &str,
+    ids: &[&str],
+) -> Result<Vec<Option<TrackObject>>, ClientError> {
+    let what = "tracks lookup";
+    let req = state
+        .http
+        .get(format!("{}/tracks", state.config.spotify_api_base))
+        .bearer_auth(access_token)
+        .query(&[("ids", ids.join(","))]);
+    parse::<SeveralTracks>(send(req, what).await?, Service::WebApi, what)
+        .await
+        .map(|r| r.tracks)
+}
+
+/// One track (`GET /tracks/{id}`); `None` when Spotify does not know the id
+/// (404, or 400 for a malformed one). `id` must be URL-safe.
+pub async fn get_track(
+    state: &AppState,
+    access_token: &str,
+    id: &str,
+) -> Result<Option<TrackObject>, ClientError> {
+    let what = "track lookup";
+    let req = state
+        .http
+        .get(format!("{}/tracks/{id}", state.config.spotify_api_base))
+        .bearer_auth(access_token);
+    not_found_as_none(parse(send(req, what).await?, Service::WebApi, what).await)
+}
+
+/// Several artists in one call (`GET /artists?ids=`, at most
+/// [`MAX_IDS_PER_LOOKUP`] ids): one entry per id, in order, `None` for an id
+/// Spotify does not know. Development Mode apps no longer have it (403).
+pub async fn get_several_artists(
+    state: &AppState,
+    access_token: &str,
+    ids: &[&str],
+) -> Result<Vec<Option<FullArtist>>, ClientError> {
+    let what = "artists lookup";
+    let req = state
+        .http
+        .get(format!("{}/artists", state.config.spotify_api_base))
+        .bearer_auth(access_token)
+        .query(&[("ids", ids.join(","))]);
+    parse::<SeveralArtists>(send(req, what).await?, Service::WebApi, what)
+        .await
+        .map(|r| r.artists)
+}
+
+/// One artist (`GET /artists/{id}`); `None` when Spotify does not know the id
+/// (404, or 400 for a malformed one). `id` must be URL-safe.
+pub async fn get_artist(
+    state: &AppState,
+    access_token: &str,
+    id: &str,
+) -> Result<Option<FullArtist>, ClientError> {
+    let what = "artist lookup";
+    let req = state
+        .http
+        .get(format!("{}/artists/{id}", state.config.spotify_api_base))
+        .bearer_auth(access_token);
+    not_found_as_none(parse(send(req, what).await?, Service::WebApi, what).await)
+}
+
+fn not_found_as_none<T>(result: Result<T, ClientError>) -> Result<Option<T>, ClientError> {
+    match result {
+        Ok(v) => Ok(Some(v)),
+        Err(ClientError::Status {
+            status: 400 | 404, ..
+        }) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]
